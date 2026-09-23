@@ -1,0 +1,5 @@
+bin/
+obj/
+*.user
+examples/*.dll
+examples/*.runtimeconfig.json
