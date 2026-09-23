@@ -81,7 +81,8 @@ public sealed class CodeGen
         int ArgIndex,
         bool IsByRef = false,
         ArrayInfo? Array = null,
-        string? RecordType = null);
+        string? RecordType = null,
+        string? ClassType = null);
 
     private sealed record FuncInfo(MethodBuilder Method, PascalType? ReturnType, string? ReturnRecordType, List<ParamDecl> Params)
     {
@@ -93,10 +94,20 @@ public sealed class CodeGen
         ConstructorBuilder Ctor,
         Dictionary<string, (FieldBuilder Field, PascalType Type)> Fields);
 
+    private sealed record ClassMethodInfo(MethodBuilder Method, PascalType? ReturnType, List<ParamDecl> Params);
+
+    private sealed record ClassTypeInfo(
+        TypeBuilder Type,
+        ConstructorBuilder Ctor,
+        Dictionary<string, (FieldBuilder Field, PascalType Type)> Fields,
+        Dictionary<string, ClassMethodInfo> Methods);
+
     private ILGenerator _il = null!;
     private Dictionary<string, VarSlot> _symbols = null!;
+    private ClassTypeInfo? _currentClass; // set while compiling a class method body, for implicit Self.field access
     private readonly Dictionary<string, FuncInfo> _functions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, RecordTypeInfo> _recordTypes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, ClassTypeInfo> _classTypes = new(StringComparer.OrdinalIgnoreCase);
 
     public void Compile(PascalProgram program, string outputPath)
     {
@@ -126,6 +137,54 @@ public sealed class CodeGen
             }
 
             _recordTypes[rt.Name] = new RecordTypeInfo(recTypeBuilder, ctor, fields);
+        }
+
+        // Pass 0.5: declare class types — fields and method *signatures* (as real, non-static
+        // CLR instance methods; Self is the implicit CLR "this"). Bodies come in Pass 2.5,
+        // once every class and free-function signature exists (recursion, forward refs).
+        var seenClassType = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var ct in program.ClassTypes)
+        {
+            if (!seenClassType.Add(ct.Name) || _recordTypes.ContainsKey(ct.Name))
+                throw new SemanticError($"el tipo '{ct.Name}' ya está declarado", ct.Line, ct.Col);
+
+            var classTypeBuilder = moduleBuilder.DefineType(ct.Name, TypeAttributes.Public | TypeAttributes.Class);
+            var ctor = classTypeBuilder.DefineDefaultConstructor(MethodAttributes.Public);
+
+            var fields = new Dictionary<string, (FieldBuilder, PascalType)>(StringComparer.OrdinalIgnoreCase);
+            var seenField = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var f in ct.Fields)
+            {
+                if (!seenField.Add(f.Name))
+                    throw new SemanticError($"el campo '{f.Name}' ya está declarado en '{ct.Name}'", f.Line, f.Col);
+                var fb = classTypeBuilder.DefineField(f.Name, ClrType(f.Type), FieldAttributes.Public);
+                fields[f.Name] = (fb, f.Type);
+            }
+
+            var methods = new Dictionary<string, ClassMethodInfo>(StringComparer.OrdinalIgnoreCase);
+            var seenMethod = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var m in ct.Methods)
+            {
+                if (!seenMethod.Add(m.Name))
+                    throw new SemanticError($"el método '{m.Name}' ya está declarado en '{ct.Name}'", m.Line, m.Col);
+                if (fields.ContainsKey(m.Name))
+                    throw new SemanticError($"'{m.Name}' ya está declarado como campo en '{ct.Name}'", m.Line, m.Col);
+
+                var mParamTypes = m.Params.Select(ParamClrType).ToArray();
+                var mReturnClr = m.ReturnType.HasValue ? ClrType(m.ReturnType.Value) : typeof(void);
+                var methodBuilder = classTypeBuilder.DefineMethod(
+                    m.Name,
+                    MethodAttributes.Public | MethodAttributes.HideBySig, // instance method: Self is the implicit CLR "this"
+                    mReturnClr,
+                    mParamTypes);
+
+                for (int i = 0; i < m.Params.Count; i++)
+                    methodBuilder.DefineParameter(i + 1, ParameterAttributes.None, m.Params[i].Name);
+
+                methods[m.Name] = new ClassMethodInfo(methodBuilder, m.ReturnType, m.Params);
+            }
+
+            _classTypes[ct.Name] = new ClassTypeInfo(classTypeBuilder, ctor, fields, methods);
         }
 
         // Pass 1: declare all function/procedure signatures so calls (incl. recursive and forward) resolve.
@@ -167,6 +226,29 @@ public sealed class CodeGen
         foreach (var sub in program.Subs)
             CompileSub(sub);
 
+        // Pass 2.5: emit bodies for class method implementations declared elsewhere in the file.
+        var seenImpl = new HashSet<(string ClassName, string MethodName)>();
+        foreach (var impl in program.MethodImpls)
+        {
+            if (!_classTypes.TryGetValue(impl.ClassName, out var classInfo))
+                throw new SemanticError($"la clase '{impl.ClassName}' no está declarada", impl.Line, impl.Col);
+            if (!classInfo.Methods.TryGetValue(impl.MethodName, out var methodInfo))
+                throw new SemanticError($"'{impl.ClassName}' no declara un método '{impl.MethodName}'", impl.Line, impl.Col);
+            if (!seenImpl.Add((impl.ClassName, impl.MethodName)))
+                throw new SemanticError($"'{impl.ClassName}.{impl.MethodName}' ya tiene una implementación", impl.Line, impl.Col);
+
+            bool paramsMatch = impl.Params.Count == methodInfo.Params.Count &&
+                impl.Params.Zip(methodInfo.Params).All(p => p.First.Type == p.Second.Type && p.First.ByRef == p.Second.ByRef);
+            if (!paramsMatch || impl.ReturnType != methodInfo.ReturnType)
+                throw new SemanticError($"la implementación de '{impl.ClassName}.{impl.MethodName}' no coincide con su firma declarada en la clase", impl.Line, impl.Col);
+
+            CompileMethodImpl(classInfo, methodInfo, impl);
+        }
+        foreach (var ct in program.ClassTypes)
+            foreach (var m in ct.Methods)
+                if (!seenImpl.Contains((ct.Name, m.Name)))
+                    throw new SemanticError($"falta la implementación de '{ct.Name}.{m.Name}'", m.Line, m.Col);
+
         // Pass 3: emit Main, which hosts the program's global vars and top-level statements.
         var mainMethod = typeBuilder.DefineMethod(
             "Main",
@@ -189,6 +271,8 @@ public sealed class CodeGen
 
         foreach (var rt in _recordTypes.Values)
             rt.Type.CreateType();
+        foreach (var ct in _classTypes.Values)
+            ct.Type.CreateType();
         typeBuilder.CreateType();
 
         var metadataBuilder = asmBuilder.GenerateMetadata(out var ilStream, out var fieldData);
@@ -224,7 +308,7 @@ public sealed class CodeGen
         {
             var p = sub.Params[i];
             if (p.RecordType is not null)
-                _symbols[p.Name] = new VarSlot(PascalType.Void, SlotKind.Arg, null, i, false, null, p.RecordType);
+                _symbols[p.Name] = MakeNamedTypeSlot(p.RecordType, SlotKind.Arg, null, i, p.Line, p.Col);
             else if (p.Array is not null)
                 _symbols[p.Name] = new VarSlot(p.Array.ElementType, SlotKind.Arg, null, i, false, p.Array);
             else
@@ -258,6 +342,59 @@ public sealed class CodeGen
         if (resultLocal is not null)
             _il.Emit(OpCodes.Ldloc, resultLocal);
         _il.Emit(OpCodes.Ret);
+    }
+
+    // Builds a VarSlot for a variable/param/Result declared with a named type (record or
+    // class) — the AST only carries the type name; here we know which kind it resolves to.
+    private VarSlot MakeNamedTypeSlot(string typeName, SlotKind kind, LocalBuilder? local, int argIndex, int line, int col)
+    {
+        if (_recordTypes.ContainsKey(typeName))
+            return new VarSlot(PascalType.Void, kind, local, argIndex, false, null, typeName, null);
+        if (_classTypes.ContainsKey(typeName))
+            return new VarSlot(PascalType.Void, kind, local, argIndex, false, null, null, typeName);
+        throw new SemanticError($"tipo '{typeName}' no declarado", line, col);
+    }
+
+    private void CompileMethodImpl(ClassTypeInfo classInfo, ClassMethodInfo methodInfo, MethodImplDecl impl)
+    {
+        _il = methodInfo.Method.GetILGenerator();
+        _symbols = new Dictionary<string, VarSlot>(StringComparer.OrdinalIgnoreCase);
+        _currentClass = classInfo;
+
+        // Self is CLR arg 0 on a non-static instance method; declared params start at arg 1.
+        _symbols["Self"] = new VarSlot(PascalType.Void, SlotKind.Arg, null, 0, false, null, null, impl.ClassName);
+        for (int i = 0; i < impl.Params.Count; i++)
+        {
+            var p = impl.Params[i];
+            if (p.RecordType is not null)
+                _symbols[p.Name] = MakeNamedTypeSlot(p.RecordType, SlotKind.Arg, null, i + 1, p.Line, p.Col);
+            else if (p.Array is not null)
+                _symbols[p.Name] = new VarSlot(p.Array.ElementType, SlotKind.Arg, null, i + 1, false, p.Array);
+            else
+                _symbols[p.Name] = new VarSlot(p.Type, SlotKind.Arg, null, i + 1, p.ByRef);
+        }
+
+        LocalBuilder? resultLocal = null;
+        if (impl.ReturnType.HasValue)
+        {
+            resultLocal = _il.DeclareLocal(ClrType(impl.ReturnType.Value));
+            _symbols["Result"] = new VarSlot(impl.ReturnType.Value, SlotKind.Local, resultLocal, -1);
+        }
+
+        foreach (var v in impl.Locals)
+        {
+            if (_symbols.ContainsKey(v.Name))
+                throw new SemanticError($"'{v.Name}' ya está declarado en '{impl.ClassName}.{impl.MethodName}'", v.Line, v.Col);
+            DeclareLocalVar(v);
+        }
+
+        EmitStmt(impl.Body);
+
+        if (resultLocal is not null)
+            _il.Emit(OpCodes.Ldloc, resultLocal);
+        _il.Emit(OpCodes.Ret);
+
+        _currentClass = null;
     }
 
     private static string BuildRuntimeConfig()
@@ -297,9 +434,10 @@ public sealed class CodeGen
     {
         if (p.RecordType is not null)
         {
-            if (!_recordTypes.TryGetValue(p.RecordType, out var rec))
-                throw new SemanticError($"tipo '{p.RecordType}' no declarado", p.Line, p.Col);
-            return rec.Type; // reference type; 'var' is a no-op on it, same as arrays
+            // reference type either way; 'var' is a no-op on it, same as arrays
+            if (_recordTypes.TryGetValue(p.RecordType, out var rec)) return rec.Type;
+            if (_classTypes.TryGetValue(p.RecordType, out var cls)) return cls.Type;
+            throw new SemanticError($"tipo '{p.RecordType}' no declarado", p.Line, p.Col);
         }
         if (p.Array is not null)
         {
@@ -315,14 +453,25 @@ public sealed class CodeGen
     {
         if (v.RecordType is not null)
         {
-            if (!_recordTypes.TryGetValue(v.RecordType, out var rec))
-                throw new SemanticError($"tipo '{v.RecordType}' no declarado", v.Line, v.Col);
-            var local = _il.DeclareLocal(rec.Type);
-            _il.Emit(OpCodes.Newobj, rec.Ctor);
-            _il.Emit(OpCodes.Stloc, local);
-            _symbols[v.Name] = new VarSlot(PascalType.Void, SlotKind.Local, local, -1, false, null, v.RecordType);
+            if (_recordTypes.TryGetValue(v.RecordType, out var rec))
+            {
+                var local = _il.DeclareLocal(rec.Type);
+                _il.Emit(OpCodes.Newobj, rec.Ctor);
+                _il.Emit(OpCodes.Stloc, local);
+                _symbols[v.Name] = new VarSlot(PascalType.Void, SlotKind.Local, local, -1, false, null, v.RecordType, null);
+                return;
+            }
+            if (_classTypes.TryGetValue(v.RecordType, out var cls))
+            {
+                // Real object semantics: starts as null (CLR zero-inits locals); the program
+                // must call TClase.Create() explicitly before using it.
+                var local = _il.DeclareLocal(cls.Type);
+                _symbols[v.Name] = new VarSlot(PascalType.Void, SlotKind.Local, local, -1, false, null, null, v.RecordType);
+                return;
+            }
+            throw new SemanticError($"tipo '{v.RecordType}' no declarado", v.Line, v.Col);
         }
-        else if (v.Array is not null && v.Array.Is2D)
+        if (v.Array is not null && v.Array.Is2D)
         {
             var elemClr = ClrType(v.Array.ElementType);
             var innerClr = elemClr.MakeArrayType();
@@ -512,9 +661,14 @@ public sealed class CodeGen
     // by name (without an index / field) is a distinct kind of expression in this language.
     private PascalType TypeOfVar(VarExpr v)
     {
+        if (!_symbols.ContainsKey(v.Name) && _currentClass is not null && _currentClass.Fields.TryGetValue(v.Name, out var implicitField))
+            return implicitField.Type; // unqualified field access inside a method body (implicit Self.name)
+
         var slot = LookupVar(v.Name, v.Line, v.Col);
         if (slot.RecordType is not null)
             throw new SemanticError($"'{v.Name}' es un record; usa '{v.Name}.campo' para acceder a sus campos", v.Line, v.Col);
+        if (slot.ClassType is not null)
+            throw new SemanticError($"'{v.Name}' es un objeto; usa '{v.Name}.campo' o '{v.Name}.Metodo()'", v.Line, v.Col);
         if (slot.Array is not null)
             throw new SemanticError($"'{v.Name}' es un array; usa '{v.Name}[indice]' para acceder a sus elementos", v.Line, v.Col);
         return slot.Type;
@@ -561,18 +715,71 @@ public sealed class CodeGen
         UnaryExpr u => TypeOfUnary(u),
         BinaryExpr b => TypeOfBinary(b),
         FuncCallExpr f => TryTypeOfBuiltin(f, out var bt) ? bt : TypeOfCall(f),
+        QualifiedCallExpr qc => TypeOfQualified(qc),
         _ => throw new InvalidOperationException("expresión no soportada"),
     };
+
+    // obj.Metodo() used as a value (must return a scalar). TClase.Create() is only valid
+    // directly on the right-hand side of a class-typed assignment (see EmitAssign), so
+    // reaching it here means it wasn't used that way.
+    private PascalType TypeOfQualified(QualifiedCallExpr qc)
+    {
+        if (_classTypes.ContainsKey(qc.Target))
+            throw new SemanticError(
+                $"'{qc.Target}.{qc.Member}' solo puede usarse para inicializar una variable de tipo '{qc.Target}' (ej. 'obj := {qc.Target}.Create()')", qc.Line, qc.Col);
+
+        var slot = LookupVar(qc.Target, qc.Line, qc.Col);
+        if (slot.ClassType is null)
+            throw new SemanticError($"'{qc.Target}' no es un objeto", qc.Line, qc.Col);
+
+        var classInfo = _classTypes[slot.ClassType];
+        if (!classInfo.Methods.TryGetValue(qc.Member, out var method))
+            throw new SemanticError($"'{slot.ClassType}' no tiene un método '{qc.Member}'", qc.Line, qc.Col);
+        if (!method.ReturnType.HasValue)
+            throw new SemanticError($"'{qc.Member}' es un procedimiento y no puede usarse como expresión", qc.Line, qc.Col);
+
+        CheckMethodArgs(slot.ClassType, qc.Member, method.Params, qc.Args, qc.Line, qc.Col);
+        return method.ReturnType.Value;
+    }
+
+    private void CheckMethodArgs(string className, string methodName, List<ParamDecl> parameters, List<Expr> args, int line, int col)
+    {
+        if (args.Count != parameters.Count)
+            throw new SemanticError($"'{className}.{methodName}' espera {parameters.Count} argumento(s), se dieron {args.Count}", line, col);
+        for (int i = 0; i < args.Count; i++)
+        {
+            var param = parameters[i];
+            var argType = TypeOf(args[i]);
+            bool promote = param.Type == PascalType.Real && argType == PascalType.Integer;
+            if (!promote && argType != param.Type)
+                throw new SemanticError($"el argumento {i + 1} de '{className}.{methodName}' debe ser {TypeName(param.Type)}, se dio {TypeName(argType)}", line, col);
+        }
+    }
+
+    // Resolves a field regardless of whether the slot holds a record or a class instance.
+    private (FieldBuilder Field, PascalType Type) ResolveField(VarSlot slot, string fieldName, string varName, int line, int col)
+    {
+        if (slot.RecordType is not null)
+        {
+            var rec = _recordTypes[slot.RecordType];
+            if (!rec.Fields.TryGetValue(fieldName, out var field))
+                throw new SemanticError($"'{varName}' no tiene un campo '{fieldName}'", line, col);
+            return field;
+        }
+        if (slot.ClassType is not null)
+        {
+            var cls = _classTypes[slot.ClassType];
+            if (!cls.Fields.TryGetValue(fieldName, out var field))
+                throw new SemanticError($"'{varName}' no tiene un campo '{fieldName}'", line, col);
+            return field;
+        }
+        throw new SemanticError($"'{varName}' no es un record ni un objeto", line, col);
+    }
 
     private PascalType TypeOfFieldAccess(FieldAccessExpr fa)
     {
         var slot = LookupVar(fa.RecordVarName, fa.Line, fa.Col);
-        if (slot.RecordType is null)
-            throw new SemanticError($"'{fa.RecordVarName}' no es un record", fa.Line, fa.Col);
-        var rec = _recordTypes[slot.RecordType];
-        if (!rec.Fields.TryGetValue(fa.FieldName, out var field))
-            throw new SemanticError($"'{fa.RecordVarName}' no tiene un campo '{fa.FieldName}'", fa.Line, fa.Col);
-        return field.Type;
+        return ResolveField(slot, fa.FieldName, fa.RecordVarName, fa.Line, fa.Col).Type;
     }
 
     private void RequireArgs(FuncCallExpr f, int count)
@@ -1019,7 +1226,13 @@ public sealed class CodeGen
                 return PascalType.Boolean;
             case VarExpr v:
             {
-                var type = TypeOfVar(v); // validates it's a plain scalar, not an array/record
+                var type = TypeOfVar(v); // validates it's a plain scalar, not an array/record/object
+                if (!_symbols.ContainsKey(v.Name) && _currentClass is not null)
+                {
+                    _il.Emit(OpCodes.Ldarg_0); // Self
+                    _il.Emit(OpCodes.Ldfld, _currentClass.Fields[v.Name].Field);
+                    return type;
+                }
                 EmitLoad(LookupVar(v.Name, v.Line, v.Col));
                 return type;
             }
@@ -1033,19 +1246,37 @@ public sealed class CodeGen
                 return EmitBinary(b);
             case FuncCallExpr f:
                 return TryEmitBuiltin(f, out var bt) ? bt : EmitCall(f);
+            case QualifiedCallExpr qc:
+                return EmitQualifiedCallExpr(qc);
             default:
                 throw new InvalidOperationException("expresión no soportada");
         }
+    }
+
+    private PascalType EmitQualifiedCallExpr(QualifiedCallExpr qc)
+    {
+        var type = TypeOfQualified(qc); // validates
+        var slot = LookupVar(qc.Target, qc.Line, qc.Col);
+        var classInfo = _classTypes[slot.ClassType!];
+        var method = classInfo.Methods[qc.Member];
+
+        EmitLoad(slot); // Self
+        for (int i = 0; i < qc.Args.Count; i++)
+        {
+            var argType = TypeOf(qc.Args[i]);
+            EmitPromoted(qc.Args[i], argType, method.Params[i].Type == PascalType.Real);
+        }
+        _il.Emit(OpCodes.Callvirt, method.Method);
+        return type;
     }
 
     private PascalType EmitFieldAccess(FieldAccessExpr fa)
     {
         var type = TypeOfFieldAccess(fa); // validates
         var slot = LookupVar(fa.RecordVarName, fa.Line, fa.Col);
-        var rec = _recordTypes[slot.RecordType!];
-        var field = rec.Fields[fa.FieldName].Field;
-        EmitLoad(slot); // record reference
-        _il.Emit(OpCodes.Ldfld, field);
+        var field = ResolveField(slot, fa.FieldName, fa.RecordVarName, fa.Line, fa.Col);
+        EmitLoad(slot); // record/object reference
+        _il.Emit(OpCodes.Ldfld, field.Field);
         return type;
     }
 
@@ -1275,12 +1506,50 @@ public sealed class CodeGen
                 EmitProcCall(call);
                 break;
 
+            case QualifiedCallStmt qc:
+                EmitQualifiedCallStmt(qc);
+                break;
+
             case EmptyStmt:
                 break;
 
             default:
                 throw new InvalidOperationException("instrucción no soportada");
         }
+    }
+
+    private void EmitQualifiedCallStmt(QualifiedCallStmt qc)
+    {
+        if (_classTypes.TryGetValue(qc.Target, out var classInfoForCtor))
+        {
+            if (!string.Equals(qc.Member, "Create", StringComparison.OrdinalIgnoreCase))
+                throw new SemanticError($"solo se soporta '{qc.Target}.Create()' para construir instancias por ahora", qc.Line, qc.Col);
+            if (qc.Args.Count != 0)
+                throw new SemanticError("'Create' no admite argumentos todavía", qc.Line, qc.Col);
+            _il.Emit(OpCodes.Newobj, classInfoForCtor.Ctor);
+            _il.Emit(OpCodes.Pop); // discarded; usually you'd assign this to a variable instead
+            return;
+        }
+
+        var slot = LookupVar(qc.Target, qc.Line, qc.Col);
+        if (slot.ClassType is null)
+            throw new SemanticError($"'{qc.Target}' no es un objeto", qc.Line, qc.Col);
+
+        var classInfo = _classTypes[slot.ClassType];
+        if (!classInfo.Methods.TryGetValue(qc.Member, out var method))
+            throw new SemanticError($"'{slot.ClassType}' no tiene un método '{qc.Member}'", qc.Line, qc.Col);
+        if (method.ReturnType.HasValue)
+            throw new SemanticError($"'{qc.Member}' es una función; asigne su resultado a una variable en lugar de llamarla como instrucción", qc.Line, qc.Col);
+
+        CheckMethodArgs(slot.ClassType, qc.Member, method.Params, qc.Args, qc.Line, qc.Col);
+
+        EmitLoad(slot); // Self
+        for (int i = 0; i < qc.Args.Count; i++)
+        {
+            var argType = TypeOf(qc.Args[i]);
+            EmitPromoted(qc.Args[i], argType, method.Params[i].Type == PascalType.Real);
+        }
+        _il.Emit(OpCodes.Callvirt, method.Method);
     }
 
     private void EmitProcCall(ProcCallStmt call)
@@ -1298,6 +1567,21 @@ public sealed class CodeGen
 
     private void EmitAssign(AssignStmt a)
     {
+        if (!_symbols.ContainsKey(a.Name) && _currentClass is not null && _currentClass.Fields.TryGetValue(a.Name, out var implicitField))
+        {
+            // Unqualified assignment inside a method body (implicit Self.name := ...).
+            var implicitValType = TypeOf(a.Value);
+            bool implicitPromote = implicitField.Type == PascalType.Real && implicitValType == PascalType.Integer;
+            if (!implicitPromote && implicitField.Type != implicitValType)
+                throw new SemanticError($"no se puede asignar un valor de tipo {TypeName(implicitValType)} al campo '{a.Name}' de tipo {TypeName(implicitField.Type)}", a.Line, a.Col);
+
+            _il.Emit(OpCodes.Ldarg_0); // Self
+            EmitExpr(a.Value);
+            if (implicitPromote) _il.Emit(OpCodes.Conv_R8);
+            _il.Emit(OpCodes.Stfld, implicitField.Field);
+            return;
+        }
+
         var sym = LookupVar(a.Name, a.Line, a.Col);
         if (sym.Array is not null)
             throw new SemanticError($"no se puede asignar directamente a un array completo; asigne elemento por elemento ('{a.Name}[i] := ...')", a.Line, a.Col);
@@ -1324,6 +1608,29 @@ public sealed class CodeGen
             throw new SemanticError("solo se puede asignar un record a partir de otra variable o una función que devuelva ese tipo", a.Line, a.Col);
         }
 
+        if (sym.ClassType is not null)
+        {
+            // Objects are reference types: assignment from a variable aliases the same
+            // instance; TClase.Create() constructs a brand-new one.
+            if (a.Value is VarExpr ve)
+            {
+                var srcSlot = LookupVar(ve.Name, ve.Line, ve.Col);
+                if (srcSlot.ClassType != sym.ClassType)
+                    throw new SemanticError($"no se puede asignar '{ve.Name}' a '{a.Name}': son de tipos distintos", a.Line, a.Col);
+                EmitStoreTo(sym, () => EmitLoad(srcSlot));
+                return;
+            }
+            if (a.Value is QualifiedCallExpr qc && string.Equals(qc.Target, sym.ClassType, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(qc.Member, "Create", StringComparison.OrdinalIgnoreCase))
+            {
+                if (qc.Args.Count != 0)
+                    throw new SemanticError("'Create' no admite argumentos todavía", a.Line, a.Col);
+                EmitStoreTo(sym, () => _il.Emit(OpCodes.Newobj, _classTypes[sym.ClassType].Ctor));
+                return;
+            }
+            throw new SemanticError($"solo se puede asignar un objeto a partir de otra variable del mismo tipo o '{sym.ClassType}.Create()'", a.Line, a.Col);
+        }
+
         var valType = TypeOf(a.Value);
 
         bool promote = sym.Type == PascalType.Real && valType == PascalType.Integer;
@@ -1340,18 +1647,14 @@ public sealed class CodeGen
     private void EmitFieldAssign(FieldAssignStmt s)
     {
         var slot = LookupVar(s.RecordVarName, s.Line, s.Col);
-        if (slot.RecordType is null)
-            throw new SemanticError($"'{s.RecordVarName}' no es un record", s.Line, s.Col);
-        var rec = _recordTypes[slot.RecordType];
-        if (!rec.Fields.TryGetValue(s.FieldName, out var field))
-            throw new SemanticError($"'{s.RecordVarName}' no tiene un campo '{s.FieldName}'", s.Line, s.Col);
+        var field = ResolveField(slot, s.FieldName, s.RecordVarName, s.Line, s.Col);
 
         var valType = TypeOf(s.Value);
         bool promote = field.Type == PascalType.Real && valType == PascalType.Integer;
         if (!promote && field.Type != valType)
             throw new SemanticError($"no se puede asignar un valor de tipo {TypeName(valType)} al campo '{s.FieldName}' de tipo {TypeName(field.Type)}", s.Line, s.Col);
 
-        EmitLoad(slot); // record reference
+        EmitLoad(slot); // record/object reference
         EmitExpr(s.Value);
         if (promote) _il.Emit(OpCodes.Conv_R8);
         _il.Emit(OpCodes.Stfld, field.Field);

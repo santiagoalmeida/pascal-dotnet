@@ -10,6 +10,20 @@ public sealed record ArrayInfo(PascalType ElementType, int Low, int High, int? L
 public sealed record RecordField(string Name, PascalType Type, int Line, int Col);
 public sealed record RecordTypeDecl(string Name, List<RecordField> Fields, int Line, int Col);
 
+public sealed record ClassField(string Name, PascalType Type, int Line, int Col);
+public sealed record ClassMethodSig(string Name, List<ParamDecl> Params, PascalType? ReturnType, int Line, int Col);
+public sealed record ClassTypeDecl(string Name, List<ClassField> Fields, List<ClassMethodSig> Methods, int Line, int Col);
+
+public sealed record MethodImplDecl(
+    string ClassName,
+    string MethodName,
+    List<ParamDecl> Params,
+    PascalType? ReturnType,
+    List<VarDecl> Locals,
+    CompoundStmt Body,
+    int Line,
+    int Col);
+
 public abstract record Expr;
 
 public sealed record IntLiteralExpr(int Value) : Expr;
@@ -23,6 +37,11 @@ public sealed record UnaryExpr(TokenType Op, Expr Operand, int Line, int Col) : 
 public sealed record BinaryExpr(TokenType Op, Expr Left, Expr Right, int Line, int Col) : Expr;
 public sealed record FuncCallExpr(string Name, List<Expr> Args, int Line, int Col) : Expr;
 
+// obj.Metodo(args) as a value, or TClase.Create() to construct an instance.
+// Which one it is (constructor vs. instance method call) is resolved semantically,
+// by checking whether Target names a declared class type or a variable.
+public sealed record QualifiedCallExpr(string Target, string Member, List<Expr> Args, int Line, int Col) : Expr;
+
 public abstract record Stmt;
 
 public sealed record AssignStmt(string Name, Expr Value, int Line, int Col) : Stmt;
@@ -35,11 +54,15 @@ public sealed record CompoundStmt(List<Stmt> Statements) : Stmt;
 public sealed record WriteLnStmt(List<Expr> Args, bool Newline) : Stmt;
 public sealed record ReadLnStmt : Stmt;
 public sealed record ProcCallStmt(string Name, List<Expr> Args, int Line, int Col) : Stmt;
+public sealed record QualifiedCallStmt(string Target, string Member, List<Expr> Args, int Line, int Col) : Stmt;
 public sealed record EmptyStmt : Stmt;
 
 public sealed record CaseBranch(List<Expr> Labels, Stmt Body);
 public sealed record CaseStmt(Expr Selector, List<CaseBranch> Branches, Stmt? ElseBranch, int Line, int Col) : Stmt;
 
+// RecordType is a generic "named type" reference at the AST level: it holds an
+// identifier that names either a record or a class type. Which one it is gets
+// resolved later, in CodeGen, where declared types are known.
 public sealed record VarDecl(string Name, PascalType Type, int Line, int Col, ArrayInfo? Array = null, string? RecordType = null);
 public sealed record ParamDecl(string Name, PascalType Type, bool ByRef, int Line, int Col, ArrayInfo? Array = null, string? RecordType = null);
 
@@ -58,4 +81,6 @@ public sealed record PascalProgram(
     List<VarDecl> Vars,
     List<SubDecl> Subs,
     List<RecordTypeDecl> RecordTypes,
+    List<ClassTypeDecl> ClassTypes,
+    List<MethodImplDecl> MethodImpls,
     CompoundStmt Body);

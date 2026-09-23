@@ -169,6 +169,38 @@ end;
 
 Los records pueden usarse como parámetros y como tipo de retorno de función.
 
+### Clases (OOP)
+
+```pascal
+type
+  TCounter = class
+    value: integer;
+    procedure Increment;
+    function GetValue: integer;
+  end;
+
+procedure TCounter.Increment;
+begin
+  value := value + 1;   // campo implícito: equivale a Self.value
+end;
+
+function TCounter.GetValue: integer;
+begin
+  Result := value;
+end;
+
+var
+  c: TCounter;
+begin
+  c := TCounter.Create();
+  c.Increment();
+  c.Increment();
+  writeln(c.GetValue());  // 2
+end.
+```
+
+Los métodos se compilan como métodos de instancia **reales** de CLR (no procedimientos estáticos con un parámetro extra) — `Self` es el `this` implícito, y las llamadas usan `callvirt`. `TClase.Create()` construye una instancia nueva; una variable de tipo clase empieza en `nil` hasta que se le asigna una. Por ahora **no hay herencia** (`class(TPadre)`) ni métodos `virtual`/`override` — ver Limitaciones.
+
 ### Funciones incorporadas
 
 | Función | Firma | Descripción |
@@ -235,6 +267,7 @@ Ver `PascalCompiler/examples/api_auth.pas` para un flujo completo de login + JWT
 | `arrays_var.pas` | Parámetros `var`, arrays, bubble sort con `Swap(arr[i], arr[j])` |
 | `records_strings.pas` | `record`, funciones incorporadas de string/conversión |
 | `matrix_records.pas` | Arrays 2D (matrices) + records como parámetro/retorno de función |
+| `oop_counter.pas` | `class` con campos y métodos, `Self` implícito, instancias independientes |
 | `api.pas` | API HTTP con rutas parametrizadas y JSON |
 | `api_auth.pas` | Login, hashing de contraseñas y rutas protegidas con JWT |
 
@@ -245,15 +278,17 @@ Este es un proyecto experimental, no un compilador de producción. Simplificacio
 - **Arrays y records se comparten por referencia**, incluso sin `var` — se aparta de la semántica de valor estricta de Pascal, pero simplifica enormemente el codegen (son tipos `class`/array de .NET, no `struct`).
 - **Arrays 2D** son jagged arrays (`T[][]`), no arrays rectangulares nativos (`T[,]`).
 - **No hay arrays de N dimensiones genéricas** (solo 1D y 2D), ni records anidados, ni records con campos array.
+- **Las clases no soportan herencia** todavía (`class(TPadre)`), ni métodos `virtual`/`override`, ni constructores con parámetros (`Create` siempre es sin argumentos), ni parámetros/retornos de tipo clase en métodos de instancia.
 - **`HttpListener` es de un solo hilo/secuencial** (`HttpWait()` bloquea) — no maneja requests concurrentes. Suficiente para aprender/prototipar, no para producción.
 - **Sin manejo de excepciones** (`try/except`).
+- **No hay interoperabilidad genérica con .NET** (no se puede llamar a cualquier clase de la BCL o un paquete NuGet) — solo el set fijo de funciones incorporadas documentado arriba. Esto descarta, por ejemplo, un ORM como Entity Framework: necesitaría genéricos, LINQ/expression trees y `async`/`await`, que son features de compilador en sí mismas.
 - El compilador y sus mensajes de error están en **español**.
 
 ## Contribuciones
 
 Este proyecto está abierto a contribuciones — PRs, issues, ideas de features o reportes de bugs son bienvenidos. Si vas a agregar una feature grande, abrí un issue primero para discutir el enfoque (el código sigue un estilo bastante directo: sin abstracciones prematuras, con comentarios solo donde el *por qué* no es obvio).
 
-Ideas abiertas para quien quiera meter mano: `try/except`, arrays de N dimensiones, records anidados/con campos array, un modo `--optimize`, tests automatizados.
+Ideas abiertas para quien quiera meter mano: herencia y `virtual`/`override` sobre la base de OOP ya armada, `try/except`, arrays de N dimensiones, records anidados/con campos array, un mini módulo `DbXxx` sobre ADO.NET (SQL crudo) para persistencia, un modo `--optimize`, tests automatizados.
 
 ## Licencia
 

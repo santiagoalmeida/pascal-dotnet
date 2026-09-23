@@ -36,6 +36,8 @@ public sealed class Parser
         var vars = new List<VarDecl>();
         var subs = new List<SubDecl>();
         var recordTypes = new List<RecordTypeDecl>();
+        var classTypes = new List<ClassTypeDecl>();
+        var methodImpls = new List<MethodImplDecl>();
 
         while (true)
         {
@@ -45,11 +47,11 @@ public sealed class Parser
             }
             else if (Current.Type == TokenType.TypeKw)
             {
-                recordTypes.AddRange(ParseTypeSection());
+                ParseTypeSection(recordTypes, classTypes);
             }
             else if (Current.Type == TokenType.FunctionKw || Current.Type == TokenType.ProcedureKw)
             {
-                subs.Add(ParseSubDecl());
+                ParseFunctionOrMethod(subs, methodImpls);
             }
             else
             {
@@ -61,37 +63,96 @@ public sealed class Parser
         Expect(TokenType.Dot, "'.' al final del programa");
         Expect(TokenType.Eof, "fin de archivo");
 
-        return new PascalProgram(name, vars, subs, recordTypes, body);
+        return new PascalProgram(name, vars, subs, recordTypes, classTypes, methodImpls, body);
     }
 
-    private List<RecordTypeDecl> ParseTypeSection()
+    private void ParseTypeSection(List<RecordTypeDecl> recordTypes, List<ClassTypeDecl> classTypes)
     {
         Expect(TokenType.TypeKw, "'type'");
-        var decls = new List<RecordTypeDecl>();
         while (Current.Type == TokenType.Identifier)
         {
             var nameTok = Expect(TokenType.Identifier, "un identificador");
             Expect(TokenType.Eq, "'='");
-            Expect(TokenType.RecordKw, "'record'");
 
-            var fields = new List<RecordField>();
-            while (Current.Type == TokenType.Identifier)
+            if (Match(TokenType.RecordKw))
             {
-                var names = new List<Token> { Expect(TokenType.Identifier, "un identificador") };
-                while (Match(TokenType.Comma))
-                    names.Add(Expect(TokenType.Identifier, "un identificador"));
-                Expect(TokenType.Colon, "':'");
-                var fieldType = ParseType();
+                var fields = new List<RecordField>();
+                while (Current.Type == TokenType.Identifier)
+                {
+                    var names = new List<Token> { Expect(TokenType.Identifier, "un identificador") };
+                    while (Match(TokenType.Comma))
+                        names.Add(Expect(TokenType.Identifier, "un identificador"));
+                    Expect(TokenType.Colon, "':'");
+                    var fieldType = ParseType();
+                    Expect(TokenType.Semi, "';'");
+                    foreach (var n in names)
+                        fields.Add(new RecordField(n.Text, fieldType, n.Line, n.Col));
+                }
+                Expect(TokenType.End, "'end'");
                 Expect(TokenType.Semi, "';'");
-                foreach (var n in names)
-                    fields.Add(new RecordField(n.Text, fieldType, n.Line, n.Col));
+                recordTypes.Add(new RecordTypeDecl(nameTok.Text, fields, nameTok.Line, nameTok.Col));
             }
-
-            Expect(TokenType.End, "'end'");
-            Expect(TokenType.Semi, "';'");
-            decls.Add(new RecordTypeDecl(nameTok.Text, fields, nameTok.Line, nameTok.Col));
+            else if (Match(TokenType.ClassKw))
+            {
+                var fields = new List<ClassField>();
+                var methods = new List<ClassMethodSig>();
+                while (Current.Type == TokenType.Identifier
+                    || Current.Type == TokenType.FunctionKw
+                    || Current.Type == TokenType.ProcedureKw)
+                {
+                    if (Current.Type == TokenType.FunctionKw || Current.Type == TokenType.ProcedureKw)
+                    {
+                        bool isFunc = Current.Type == TokenType.FunctionKw;
+                        var mkw = Current;
+                        _pos++;
+                        var mname = Expect(TokenType.Identifier, "un identificador").Text;
+                        var mparams = ParseParamList();
+                        PascalType? mret = null;
+                        if (isFunc)
+                        {
+                            Expect(TokenType.Colon, "':' con el tipo de retorno");
+                            mret = ParseType();
+                        }
+                        Expect(TokenType.Semi, "';'");
+                        methods.Add(new ClassMethodSig(mname, mparams, mret, mkw.Line, mkw.Col));
+                    }
+                    else
+                    {
+                        var names = new List<Token> { Expect(TokenType.Identifier, "un identificador") };
+                        while (Match(TokenType.Comma))
+                            names.Add(Expect(TokenType.Identifier, "un identificador"));
+                        Expect(TokenType.Colon, "':'");
+                        var fieldType = ParseType();
+                        Expect(TokenType.Semi, "';'");
+                        foreach (var n in names)
+                            fields.Add(new ClassField(n.Text, fieldType, n.Line, n.Col));
+                    }
+                }
+                Expect(TokenType.End, "'end'");
+                Expect(TokenType.Semi, "';'");
+                classTypes.Add(new ClassTypeDecl(nameTok.Text, fields, methods, nameTok.Line, nameTok.Col));
+            }
+            else
+            {
+                throw new ParseError("se esperaba 'record' o 'class'", Current.Line, Current.Col);
+            }
         }
-        return decls;
+    }
+
+    private List<ParamDecl> ParseParamList()
+    {
+        var parameters = new List<ParamDecl>();
+        if (Match(TokenType.LParen))
+        {
+            if (Current.Type != TokenType.RParen)
+            {
+                parameters.AddRange(ParseParam());
+                while (Match(TokenType.Semi))
+                    parameters.AddRange(ParseParam());
+            }
+            Expect(TokenType.RParen, "')'");
+        }
+        return parameters;
     }
 
     private List<VarDecl> ParseVarSection()
@@ -170,23 +231,39 @@ public sealed class Parser
         return neg ? -v : v;
     }
 
-    private SubDecl ParseSubDecl()
+    // Parses either a free function/procedure, or a class method implementation
+    // ((function|procedure) ClassName.MethodName(...)), appending to the matching list.
+    private void ParseFunctionOrMethod(List<SubDecl> subs, List<MethodImplDecl> methodImpls)
     {
         bool isFunction = Current.Type == TokenType.FunctionKw;
         var kw = Expect(isFunction ? TokenType.FunctionKw : TokenType.ProcedureKw, isFunction ? "'function'" : "'procedure'");
-        var name = Expect(TokenType.Identifier, "un identificador").Text;
+        var firstName = Expect(TokenType.Identifier, "un identificador").Text;
 
-        var parameters = new List<ParamDecl>();
-        if (Match(TokenType.LParen))
+        if (Match(TokenType.Dot))
         {
-            if (Current.Type != TokenType.RParen)
+            var methodName = Expect(TokenType.Identifier, "un nombre de método").Text;
+            var mParams = ParseParamList();
+
+            PascalType? mReturnType = null;
+            if (isFunction)
             {
-                parameters.AddRange(ParseParam());
-                while (Match(TokenType.Semi))
-                    parameters.AddRange(ParseParam());
+                Expect(TokenType.Colon, "':' con el tipo de retorno");
+                mReturnType = ParseType();
             }
-            Expect(TokenType.RParen, "')'");
+            Expect(TokenType.Semi, "';'");
+
+            var mLocals = new List<VarDecl>();
+            if (Current.Type == TokenType.VarKw)
+                mLocals = ParseVarSection();
+
+            var mBody = ParseCompoundStatement();
+            Expect(TokenType.Semi, "';' después de la declaración");
+
+            methodImpls.Add(new MethodImplDecl(firstName, methodName, mParams, mReturnType, mLocals, mBody, kw.Line, kw.Col));
+            return;
         }
+
+        var parameters = ParseParamList();
 
         PascalType? returnType = null;
         string? returnRecordType = null;
@@ -212,7 +289,7 @@ public sealed class Parser
         var body = ParseCompoundStatement();
         Expect(TokenType.Semi, "';' después de la declaración");
 
-        return new SubDecl(name, parameters, returnType, returnRecordType, locals, body, kw.Line, kw.Col);
+        subs.Add(new SubDecl(firstName, parameters, returnType, returnRecordType, locals, body, kw.Line, kw.Col));
     }
 
     private List<ParamDecl> ParseParam()
@@ -294,10 +371,22 @@ public sealed class Parser
         if (Current.Type == TokenType.Dot)
         {
             _pos++;
-            var fieldTok = Expect(TokenType.Identifier, "un nombre de campo");
-            Expect(TokenType.Assign, "':='");
+            var memberTok = Expect(TokenType.Identifier, "un nombre de campo o método");
+            if (Match(TokenType.LParen))
+            {
+                var qArgs = new List<Expr>();
+                if (Current.Type != TokenType.RParen)
+                {
+                    qArgs.Add(ParseExpr());
+                    while (Match(TokenType.Comma))
+                        qArgs.Add(ParseExpr());
+                }
+                Expect(TokenType.RParen, "')'");
+                return new QualifiedCallStmt(id.Text, memberTok.Text, qArgs, id.Line, id.Col);
+            }
+            Expect(TokenType.Assign, "':=' o '('");
             var value = ParseExpr();
-            return new FieldAssignStmt(id.Text, fieldTok.Text, value, id.Line, id.Col);
+            return new FieldAssignStmt(id.Text, memberTok.Text, value, id.Line, id.Col);
         }
 
         if (Current.Type == TokenType.Assign)
@@ -539,8 +628,20 @@ public sealed class Parser
                 }
                 if (Match(TokenType.Dot))
                 {
-                    var fieldTok = Expect(TokenType.Identifier, "un nombre de campo");
-                    return new FieldAccessExpr(t.Text, fieldTok.Text, t.Line, t.Col);
+                    var memberTok = Expect(TokenType.Identifier, "un nombre de campo o método");
+                    if (Match(TokenType.LParen))
+                    {
+                        var qArgs = new List<Expr>();
+                        if (Current.Type != TokenType.RParen)
+                        {
+                            qArgs.Add(ParseExpr());
+                            while (Match(TokenType.Comma))
+                                qArgs.Add(ParseExpr());
+                        }
+                        Expect(TokenType.RParen, "')'");
+                        return new QualifiedCallExpr(t.Text, memberTok.Text, qArgs, t.Line, t.Col);
+                    }
+                    return new FieldAccessExpr(t.Text, memberTok.Text, t.Line, t.Col);
                 }
                 return new VarExpr(t.Text, t.Line, t.Col);
             }

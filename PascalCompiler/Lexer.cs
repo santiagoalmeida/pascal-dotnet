@@ -42,6 +42,7 @@ public sealed class Lexer
         ["array"] = TokenType.ArrayKw,
         ["type"] = TokenType.TypeKw,
         ["record"] = TokenType.RecordKw,
+        ["class"] = TokenType.ClassKw,
     };
 
     private readonly string _src;

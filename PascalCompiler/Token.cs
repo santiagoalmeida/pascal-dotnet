@@ -6,7 +6,7 @@ public enum TokenType
     IntegerKw, BooleanKw, StringKw, RealKw, TrueKw, FalseKw,
     Div, Mod, And, Or, Not,
     ForKw, ToKw, DownToKw, FunctionKw, ProcedureKw, CaseKw, OfKw, ConstKw, ReadLnKw, ArrayKw,
-    TypeKw, RecordKw,
+    TypeKw, RecordKw, ClassKw,
 
     Semi, Colon, Comma, Dot, DotDot, Assign,
     Plus, Minus, Star, Slash, LParen, RParen, LBracket, RBracket,
