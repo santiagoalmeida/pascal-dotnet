@@ -99,7 +99,7 @@ public sealed class CodeGen
     private sealed record ClassTypeInfo(
         TypeBuilder Type,
         ConstructorBuilder Ctor,
-        Dictionary<string, (FieldBuilder Field, PascalType Type, bool IsPrivate)> Fields,
+        Dictionary<string, (FieldBuilder Field, PascalType Type, bool IsPrivate, string? RecordType)> Fields,
         Dictionary<string, ClassMethodInfo> Methods);
 
     private ILGenerator _il = null!;
@@ -151,14 +151,29 @@ public sealed class CodeGen
             var classTypeBuilder = moduleBuilder.DefineType(ct.Name, TypeAttributes.Public | TypeAttributes.Class);
             var ctor = classTypeBuilder.DefineDefaultConstructor(MethodAttributes.Public);
 
-            var fields = new Dictionary<string, (FieldBuilder, PascalType, bool)>(StringComparer.OrdinalIgnoreCase);
+            var fields = new Dictionary<string, (FieldBuilder, PascalType, bool, string?)>(StringComparer.OrdinalIgnoreCase);
             var seenField = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var f in ct.Fields)
             {
                 if (!seenField.Add(f.Name))
                     throw new SemanticError($"el campo '{f.Name}' ya está declarado en '{ct.Name}'", f.Line, f.Col);
-                var fb = classTypeBuilder.DefineField(f.Name, ClrType(f.Type), FieldAttributes.Public);
-                fields[f.Name] = (fb, f.Type, f.IsPrivate);
+
+                if (f.RecordType is not null)
+                {
+                    // Composition field (another record/class). Must already be declared —
+                    // no forward references across type declarations for v1.
+                    Type fieldClr;
+                    if (_recordTypes.TryGetValue(f.RecordType, out var frec)) fieldClr = frec.Type;
+                    else if (_classTypes.TryGetValue(f.RecordType, out var fcls)) fieldClr = fcls.Type;
+                    else throw new SemanticError($"tipo '{f.RecordType}' no declarado", f.Line, f.Col);
+                    var fb2 = classTypeBuilder.DefineField(f.Name, fieldClr, FieldAttributes.Public);
+                    fields[f.Name] = (fb2, PascalType.Void, f.IsPrivate, f.RecordType);
+                }
+                else
+                {
+                    var fb = classTypeBuilder.DefineField(f.Name, ClrType(f.Type), FieldAttributes.Public);
+                    fields[f.Name] = (fb, f.Type, f.IsPrivate, null);
+                }
             }
 
             var methods = new Dictionary<string, ClassMethodInfo>(StringComparer.OrdinalIgnoreCase);
@@ -662,7 +677,11 @@ public sealed class CodeGen
     private PascalType TypeOfVar(VarExpr v)
     {
         if (!_symbols.ContainsKey(v.Name) && _currentClass is not null && _currentClass.Fields.TryGetValue(v.Name, out var implicitField))
+        {
+            if (implicitField.RecordType is not null)
+                throw new SemanticError($"'{v.Name}' es un objeto/record; usa '{v.Name}.campo' o '{v.Name}.Metodo()'", v.Line, v.Col);
             return implicitField.Type; // unqualified field access inside a method body (implicit Self.name)
+        }
 
         var slot = LookupVar(v.Name, v.Line, v.Col);
         if (slot.RecordType is not null)
@@ -728,19 +747,37 @@ public sealed class CodeGen
             throw new SemanticError(
                 $"'{qc.Target}.{qc.Member}' solo puede usarse para inicializar una variable de tipo '{qc.Target}' (ej. 'obj := {qc.Target}.Create()')", qc.Line, qc.Col);
 
-        var slot = LookupVar(qc.Target, qc.Line, qc.Col);
-        if (slot.ClassType is null)
+        var target = ResolveMemberTarget(qc.Target, qc.Line, qc.Col);
+        if (target.ClassType is null)
             throw new SemanticError($"'{qc.Target}' no es un objeto", qc.Line, qc.Col);
 
-        var classInfo = _classTypes[slot.ClassType];
+        var classInfo = _classTypes[target.ClassType];
         if (!classInfo.Methods.TryGetValue(qc.Member, out var method))
-            throw new SemanticError($"'{slot.ClassType}' no tiene un método '{qc.Member}'", qc.Line, qc.Col);
-        CheckAccessible(slot.ClassType, method.IsPrivate, qc.Member, qc.Line, qc.Col);
+            throw new SemanticError($"'{target.ClassType}' no tiene un método '{qc.Member}'", qc.Line, qc.Col);
+        CheckAccessible(target.ClassType, method.IsPrivate, qc.Member, qc.Line, qc.Col);
         if (!method.ReturnType.HasValue)
             throw new SemanticError($"'{qc.Member}' es un procedimiento y no puede usarse como expresión", qc.Line, qc.Col);
 
-        CheckMethodArgs(slot.ClassType, qc.Member, method.Params, qc.Args, qc.Line, qc.Col);
+        CheckMethodArgs(target.ClassType, qc.Member, method.Params, qc.Args, qc.Line, qc.Col);
         return method.ReturnType.Value;
+    }
+
+    // Emits IL for a call's arguments once CheckMethodArgs has validated them; shared by
+    // instance method calls, 'inherited' calls and TClase.Create(args).
+    private void EmitMethodArgs(List<ParamDecl> parameters, List<Expr> args)
+    {
+        for (int i = 0; i < args.Count; i++)
+        {
+            var param = parameters[i];
+            if (param.RecordType is not null)
+            {
+                var ve = (VarExpr)args[i];
+                ResolveMemberTarget(ve.Name, ve.Line, ve.Col).EmitRef();
+                continue;
+            }
+            var argType = TypeOf(args[i]);
+            EmitPromoted(args[i], argType, param.Type == PascalType.Real);
+        }
     }
 
     private void CheckMethodArgs(string className, string methodName, List<ParamDecl> parameters, List<Expr> args, int line, int col)
@@ -750,6 +787,17 @@ public sealed class CodeGen
         for (int i = 0; i < args.Count; i++)
         {
             var param = parameters[i];
+
+            if (param.RecordType is not null)
+            {
+                if (args[i] is not VarExpr ve)
+                    throw new SemanticError($"el argumento {i + 1} de '{className}.{methodName}' debe ser una variable de tipo '{param.RecordType}'", line, col);
+                var argTarget = ResolveMemberTarget(ve.Name, ve.Line, ve.Col);
+                if (argTarget.RecordType != param.RecordType && argTarget.ClassType != param.RecordType)
+                    throw new SemanticError($"el argumento {i + 1} de '{className}.{methodName}' debe ser de tipo '{param.RecordType}'", line, col);
+                continue;
+            }
+
             var argType = TypeOf(args[i]);
             bool promote = param.Type == PascalType.Real && argType == PascalType.Integer;
             if (!promote && argType != param.Type)
@@ -766,22 +814,52 @@ public sealed class CodeGen
             throw new SemanticError($"'{memberName}' es privado en '{className}' y no es accesible desde aquí", line, col);
     }
 
-    // Resolves a field regardless of whether the slot holds a record or a class instance.
-    private (FieldBuilder Field, PascalType Type, bool IsPrivate) ResolveField(VarSlot slot, string fieldName, string varName, int line, int col)
+    // A record/object "receiver" for member access (obj.field, obj.Method()) or for
+    // passing as a named-type argument — either a real local/param variable, or (inside
+    // a method body) an implicit Self.field when the name isn't a local/param.
+    private readonly record struct MemberTarget(string? RecordType, string? ClassType, Action EmitRef);
+
+    private MemberTarget ResolveMemberTarget(string name, int line, int col)
     {
-        if (slot.RecordType is not null)
+        if (_symbols.TryGetValue(name, out var slot))
         {
-            var rec = _recordTypes[slot.RecordType];
+            if (slot.RecordType is null && slot.ClassType is null)
+                throw new SemanticError($"'{name}' no es un record ni un objeto", line, col);
+            return new MemberTarget(slot.RecordType, slot.ClassType, () => EmitLoad(slot));
+        }
+        if (_currentClass is not null && _currentClass.Fields.TryGetValue(name, out var field))
+        {
+            if (field.RecordType is null)
+                throw new SemanticError($"'{name}' no es un record ni un objeto", line, col);
+            var fb = field.Field;
+            string? fRecordType = _recordTypes.ContainsKey(field.RecordType) ? field.RecordType : null;
+            string? fClassType = _classTypes.ContainsKey(field.RecordType) ? field.RecordType : null;
+            return new MemberTarget(fRecordType, fClassType, () =>
+            {
+                _il.Emit(OpCodes.Ldarg_0); // Self
+                _il.Emit(OpCodes.Ldfld, fb);
+            });
+        }
+        throw new SemanticError($"variable '{name}' no declarada", line, col);
+    }
+
+    // Resolves a field regardless of whether the receiver is a record or a class instance.
+    private (FieldBuilder Field, PascalType Type, bool IsPrivate, string? RecordType) ResolveField(
+        string? recordType, string? classType, string fieldName, string varName, int line, int col)
+    {
+        if (recordType is not null)
+        {
+            var rec = _recordTypes[recordType];
             if (!rec.Fields.TryGetValue(fieldName, out var recField))
                 throw new SemanticError($"'{varName}' no tiene un campo '{fieldName}'", line, col);
-            return (recField.Field, recField.Type, false); // records have no privacy
+            return (recField.Field, recField.Type, false, null); // records have no privacy or composition fields
         }
-        if (slot.ClassType is not null)
+        if (classType is not null)
         {
-            var cls = _classTypes[slot.ClassType];
+            var cls = _classTypes[classType];
             if (!cls.Fields.TryGetValue(fieldName, out var field))
                 throw new SemanticError($"'{varName}' no tiene un campo '{fieldName}'", line, col);
-            CheckAccessible(slot.ClassType, field.IsPrivate, fieldName, line, col);
+            CheckAccessible(classType, field.IsPrivate, fieldName, line, col);
             return field;
         }
         throw new SemanticError($"'{varName}' no es un record ni un objeto", line, col);
@@ -789,8 +867,11 @@ public sealed class CodeGen
 
     private PascalType TypeOfFieldAccess(FieldAccessExpr fa)
     {
-        var slot = LookupVar(fa.RecordVarName, fa.Line, fa.Col);
-        return ResolveField(slot, fa.FieldName, fa.RecordVarName, fa.Line, fa.Col).Type;
+        var target = ResolveMemberTarget(fa.RecordVarName, fa.Line, fa.Col);
+        var field = ResolveField(target.RecordType, target.ClassType, fa.FieldName, fa.RecordVarName, fa.Line, fa.Col);
+        if (field.RecordType is not null)
+            throw new SemanticError($"'{fa.RecordVarName}.{fa.FieldName}' es un objeto/record; usar su valor directamente no está soportado todavía", fa.Line, fa.Col);
+        return field.Type;
     }
 
     private void RequireArgs(FuncCallExpr f, int count)
@@ -1268,16 +1349,12 @@ public sealed class CodeGen
     private PascalType EmitQualifiedCallExpr(QualifiedCallExpr qc)
     {
         var type = TypeOfQualified(qc); // validates
-        var slot = LookupVar(qc.Target, qc.Line, qc.Col);
-        var classInfo = _classTypes[slot.ClassType!];
+        var target = ResolveMemberTarget(qc.Target, qc.Line, qc.Col);
+        var classInfo = _classTypes[target.ClassType!];
         var method = classInfo.Methods[qc.Member];
 
-        EmitLoad(slot); // Self
-        for (int i = 0; i < qc.Args.Count; i++)
-        {
-            var argType = TypeOf(qc.Args[i]);
-            EmitPromoted(qc.Args[i], argType, method.Params[i].Type == PascalType.Real);
-        }
+        target.EmitRef(); // Self
+        EmitMethodArgs(method.Params, qc.Args);
         _il.Emit(OpCodes.Callvirt, method.Method);
         return type;
     }
@@ -1285,9 +1362,9 @@ public sealed class CodeGen
     private PascalType EmitFieldAccess(FieldAccessExpr fa)
     {
         var type = TypeOfFieldAccess(fa); // validates
-        var slot = LookupVar(fa.RecordVarName, fa.Line, fa.Col);
-        var field = ResolveField(slot, fa.FieldName, fa.RecordVarName, fa.Line, fa.Col);
-        EmitLoad(slot); // record/object reference
+        var target = ResolveMemberTarget(fa.RecordVarName, fa.Line, fa.Col);
+        var field = ResolveField(target.RecordType, target.ClassType, fa.FieldName, fa.RecordVarName, fa.Line, fa.Col);
+        target.EmitRef(); // record/object reference
         _il.Emit(OpCodes.Ldfld, field.Field);
         return type;
     }
@@ -1543,25 +1620,21 @@ public sealed class CodeGen
             return;
         }
 
-        var slot = LookupVar(qc.Target, qc.Line, qc.Col);
-        if (slot.ClassType is null)
+        var target = ResolveMemberTarget(qc.Target, qc.Line, qc.Col);
+        if (target.ClassType is null)
             throw new SemanticError($"'{qc.Target}' no es un objeto", qc.Line, qc.Col);
 
-        var classInfo = _classTypes[slot.ClassType];
+        var classInfo = _classTypes[target.ClassType];
         if (!classInfo.Methods.TryGetValue(qc.Member, out var method))
-            throw new SemanticError($"'{slot.ClassType}' no tiene un método '{qc.Member}'", qc.Line, qc.Col);
-        CheckAccessible(slot.ClassType, method.IsPrivate, qc.Member, qc.Line, qc.Col);
+            throw new SemanticError($"'{target.ClassType}' no tiene un método '{qc.Member}'", qc.Line, qc.Col);
+        CheckAccessible(target.ClassType, method.IsPrivate, qc.Member, qc.Line, qc.Col);
         if (method.ReturnType.HasValue)
             throw new SemanticError($"'{qc.Member}' es una función; asigne su resultado a una variable en lugar de llamarla como instrucción", qc.Line, qc.Col);
 
-        CheckMethodArgs(slot.ClassType, qc.Member, method.Params, qc.Args, qc.Line, qc.Col);
+        CheckMethodArgs(target.ClassType, qc.Member, method.Params, qc.Args, qc.Line, qc.Col);
 
-        EmitLoad(slot); // Self
-        for (int i = 0; i < qc.Args.Count; i++)
-        {
-            var argType = TypeOf(qc.Args[i]);
-            EmitPromoted(qc.Args[i], argType, method.Params[i].Type == PascalType.Real);
-        }
+        target.EmitRef(); // Self
+        EmitMethodArgs(method.Params, qc.Args);
         _il.Emit(OpCodes.Callvirt, method.Method);
     }
 
@@ -1583,15 +1656,7 @@ public sealed class CodeGen
         if (!_symbols.ContainsKey(a.Name) && _currentClass is not null && _currentClass.Fields.TryGetValue(a.Name, out var implicitField))
         {
             // Unqualified assignment inside a method body (implicit Self.name := ...).
-            var implicitValType = TypeOf(a.Value);
-            bool implicitPromote = implicitField.Type == PascalType.Real && implicitValType == PascalType.Integer;
-            if (!implicitPromote && implicitField.Type != implicitValType)
-                throw new SemanticError($"no se puede asignar un valor de tipo {TypeName(implicitValType)} al campo '{a.Name}' de tipo {TypeName(implicitField.Type)}", a.Line, a.Col);
-
-            _il.Emit(OpCodes.Ldarg_0); // Self
-            EmitExpr(a.Value);
-            if (implicitPromote) _il.Emit(OpCodes.Conv_R8);
-            _il.Emit(OpCodes.Stfld, implicitField.Field);
+            EmitAssignToField(() => _il.Emit(OpCodes.Ldarg_0), implicitField, a.Value, a.Line, a.Col);
             return;
         }
 
@@ -1659,16 +1724,55 @@ public sealed class CodeGen
 
     private void EmitFieldAssign(FieldAssignStmt s)
     {
-        var slot = LookupVar(s.RecordVarName, s.Line, s.Col);
-        var field = ResolveField(slot, s.FieldName, s.RecordVarName, s.Line, s.Col);
+        var target = ResolveMemberTarget(s.RecordVarName, s.Line, s.Col);
+        var field = ResolveField(target.RecordType, target.ClassType, s.FieldName, s.RecordVarName, s.Line, s.Col);
+        EmitAssignToField(target.EmitRef, field, s.Value, s.Line, s.Col);
+    }
 
-        var valType = TypeOf(s.Value);
+    // Shared by explicit (obj.field := ...) and implicit (Self.field via a bare name)
+    // field assignment. emitTargetRef pushes the receiver (record/object reference).
+    private void EmitAssignToField(
+        Action emitTargetRef,
+        (FieldBuilder Field, PascalType Type, bool IsPrivate, string? RecordType) field,
+        Expr valueExpr,
+        int line,
+        int col)
+    {
+        if (field.RecordType is not null)
+        {
+            // Object/record-typed field: alias from a variable, or construct via Create().
+            if (valueExpr is VarExpr ve)
+            {
+                var srcTarget = ResolveMemberTarget(ve.Name, ve.Line, ve.Col);
+                if (srcTarget.RecordType != field.RecordType && srcTarget.ClassType != field.RecordType)
+                    throw new SemanticError($"no se puede asignar '{ve.Name}': es de un tipo distinto al del campo", line, col);
+                emitTargetRef();
+                srcTarget.EmitRef();
+                _il.Emit(OpCodes.Stfld, field.Field);
+                return;
+            }
+            if (valueExpr is QualifiedCallExpr qc
+                && string.Equals(qc.Target, field.RecordType, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(qc.Member, "Create", StringComparison.OrdinalIgnoreCase)
+                && _classTypes.TryGetValue(field.RecordType, out var ctorClassInfo))
+            {
+                if (qc.Args.Count != 0)
+                    throw new SemanticError("'Create' no admite argumentos todavía", line, col);
+                emitTargetRef();
+                _il.Emit(OpCodes.Newobj, ctorClassInfo.Ctor);
+                _il.Emit(OpCodes.Stfld, field.Field);
+                return;
+            }
+            throw new SemanticError("solo se puede asignar un objeto/record a partir de otra variable del mismo tipo o 'TClase.Create()'", line, col);
+        }
+
+        var valType = TypeOf(valueExpr);
         bool promote = field.Type == PascalType.Real && valType == PascalType.Integer;
         if (!promote && field.Type != valType)
-            throw new SemanticError($"no se puede asignar un valor de tipo {TypeName(valType)} al campo '{s.FieldName}' de tipo {TypeName(field.Type)}", s.Line, s.Col);
+            throw new SemanticError($"no se puede asignar un valor de tipo {TypeName(valType)} al campo de tipo {TypeName(field.Type)}", line, col);
 
-        EmitLoad(slot); // record/object reference
-        EmitExpr(s.Value);
+        emitTargetRef();
+        EmitExpr(valueExpr);
         if (promote) _il.Emit(OpCodes.Conv_R8);
         _il.Emit(OpCodes.Stfld, field.Field);
     }
