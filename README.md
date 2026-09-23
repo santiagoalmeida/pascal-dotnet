@@ -268,6 +268,9 @@ Ver `PascalCompiler/examples/api_auth.pas` para un flujo completo de login + JWT
 | `records_strings.pas` | `record`, funciones incorporadas de string/conversión |
 | `matrix_records.pas` | Arrays 2D (matrices) + records como parámetro/retorno de función |
 | `oop_counter.pas` | `class` con campos y métodos, `Self` implícito, instancias independientes |
+| `oop_rectangle.pas` | Métodos llamándose entre sí vía `Self.Metodo()`, método booleano usado en `if` |
+| `oop_bank_account.pas` | Objetos pasados como parámetro a una función libre (semántica de referencia) |
+| `oop_task.pas` | Reasignar `TClase.Create()` a la misma variable, campos `string`/`boolean` |
 | `api.pas` | API HTTP con rutas parametrizadas y JSON |
 | `api_auth.pas` | Login, hashing de contraseñas y rutas protegidas con JWT |
 
