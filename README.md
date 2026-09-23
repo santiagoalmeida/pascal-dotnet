@@ -432,7 +432,8 @@ Probado con un cliente Pascal real pegándole a un servidor Pascal real (`exampl
 | `oop_inheritance.pas` | `class(TPadre)` — campos/métodos heredados, usados desde afuera y desde `Self` |
 | `oop_polymorphism.pas` | `virtual`/`override`/`inherited` — despacho polimórfico real (no solo estático) |
 | `api.pas` | API HTTP con rutas parametrizadas y JSON |
-| `api_auth.pas` | Login, hashing de contraseñas y rutas protegidas con JWT |
+| `api_auth.pas` | Login, hashing de contraseñas y rutas protegidas con JWT (usuario fijo) |
+| `api_jwt_demo.pas` | Lo mismo pero completo: `/register`+`/login`+`/profile` con usuarios reales persistidos en SQLite |
 | `http_client.pas` | Cliente HTTP saliente (GET/POST/headers) — probado contra `api.pas` real |
 | `db_sqlite.pas` | `DbXxx` contra SQLite (archivo local) |
 | `db_postgres.pas` | `DbXxx` contra PostgreSQL |
