@@ -1084,11 +1084,12 @@ public sealed class CodeGen
 
             if (param.RecordType is not null)
             {
+                // param.RecordType names either a record or a class; either kind of variable is fine.
                 if (args[i] is not VarExpr ve)
-                    throw new SemanticError($"el argumento {i + 1} de '{name}' debe ser una variable record", line, col);
+                    throw new SemanticError($"el argumento {i + 1} de '{name}' debe ser una variable de tipo '{param.RecordType}'", line, col);
                 var argSlot = LookupVar(ve.Name, ve.Line, ve.Col);
-                if (argSlot.RecordType != param.RecordType)
-                    throw new SemanticError($"el argumento {i + 1} de '{name}' debe ser un record de tipo '{param.RecordType}'", line, col);
+                if (argSlot.RecordType != param.RecordType && argSlot.ClassType != param.RecordType)
+                    throw new SemanticError($"el argumento {i + 1} de '{name}' debe ser de tipo '{param.RecordType}'", line, col);
                 continue;
             }
 
