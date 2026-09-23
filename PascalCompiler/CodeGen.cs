@@ -94,7 +94,7 @@ public sealed class CodeGen
         ConstructorBuilder Ctor,
         Dictionary<string, (FieldBuilder Field, PascalType Type)> Fields);
 
-    private sealed record ClassMethodInfo(MethodBuilder Method, PascalType? ReturnType, List<ParamDecl> Params, bool IsPrivate);
+    private sealed record ClassMethodInfo(MethodBuilder Method, PascalType? ReturnType, List<ParamDecl> Params, bool IsPrivate, bool IsVirtual);
 
     private sealed record ClassTypeInfo(
         TypeBuilder Type,
@@ -240,21 +240,46 @@ public sealed class CodeGen
                     throw new SemanticError($"el método '{m.Name}' ya está declarado en '{ct.Name}'", m.Line, m.Col);
                 if (fields.ContainsKey(m.Name))
                     throw new SemanticError($"'{m.Name}' ya está declarado como campo en '{ct.Name}'", m.Line, m.Col);
-                if (ct.ParentName is not null && TryFindMethod(ct.ParentName, m.Name, out _, out var mOwner))
-                    throw new SemanticError($"'{m.Name}' ya está declarado en la clase base '{mOwner}'", m.Line, m.Col);
+
+                ClassMethodInfo? baseMethod = null;
+                bool hasBase = false;
+                if (ct.ParentName is not null && TryFindMethod(ct.ParentName, m.Name, out var foundBase, out _))
+                {
+                    hasBase = true;
+                    baseMethod = foundBase;
+                }
+
+                if (hasBase && !m.IsOverride)
+                    throw new SemanticError($"'{m.Name}' ya está declarado en la clase base; usá 'override' para redefinirlo", m.Line, m.Col);
+                if (m.IsOverride && !hasBase)
+                    throw new SemanticError($"'{m.Name}' tiene 'override' pero no existe en ninguna clase base", m.Line, m.Col);
+                if (m.IsOverride && !baseMethod!.IsVirtual)
+                    throw new SemanticError($"'{m.Name}' en la clase base no es 'virtual' ni 'override'; no se puede redefinir", m.Line, m.Col);
+                if (m.IsOverride)
+                {
+                    bool sigMatches = m.Params.Count == baseMethod!.Params.Count
+                        && m.Params.Zip(baseMethod.Params).All(p => p.First.Type == p.Second.Type && p.First.ByRef == p.Second.ByRef)
+                        && m.ReturnType == baseMethod.ReturnType;
+                    if (!sigMatches)
+                        throw new SemanticError($"la firma de '{m.Name}' no coincide con la de la clase base", m.Line, m.Col);
+                }
 
                 var mParamTypes = m.Params.Select(ParamClrType).ToArray();
                 var mReturnClr = m.ReturnType.HasValue ? ClrType(m.ReturnType.Value) : typeof(void);
-                var methodBuilder = classTypeBuilder.DefineMethod(
-                    m.Name,
-                    MethodAttributes.Public | MethodAttributes.HideBySig, // instance method: Self is the implicit CLR "this"
-                    mReturnClr,
-                    mParamTypes);
+
+                var attrs = MethodAttributes.Public | MethodAttributes.HideBySig; // instance method: Self is the implicit CLR "this"
+                if (m.IsVirtual) attrs |= MethodAttributes.Virtual | MethodAttributes.NewSlot;
+                else if (m.IsOverride) attrs |= MethodAttributes.Virtual; // bound to the base slot explicitly below
+
+                var methodBuilder = classTypeBuilder.DefineMethod(m.Name, attrs, mReturnClr, mParamTypes);
 
                 for (int i = 0; i < m.Params.Count; i++)
                     methodBuilder.DefineParameter(i + 1, ParameterAttributes.None, m.Params[i].Name);
 
-                methods[m.Name] = new ClassMethodInfo(methodBuilder, m.ReturnType, m.Params, m.IsPrivate);
+                if (m.IsOverride)
+                    classTypeBuilder.DefineMethodOverride(methodBuilder, baseMethod!.Method);
+
+                methods[m.Name] = new ClassMethodInfo(methodBuilder, m.ReturnType, m.Params, m.IsPrivate, m.IsVirtual || m.IsOverride);
             }
 
             _classTypes[ct.Name] = new ClassTypeInfo(classTypeBuilder, ctor, ctorParams, ct.Ctor is not null, ct.ParentName, fields, methods);
@@ -865,8 +890,21 @@ public sealed class CodeGen
         BinaryExpr b => TypeOfBinary(b),
         FuncCallExpr f => TryTypeOfBuiltin(f, out var bt) ? bt : TypeOfCall(f),
         QualifiedCallExpr qc => TypeOfQualified(qc),
+        InheritedCallExpr ic => TypeOfInherited(ic),
         _ => throw new InvalidOperationException("expresión no soportada"),
     };
+
+    private PascalType TypeOfInherited(InheritedCallExpr ic)
+    {
+        if (_currentClass is null || _currentClass.ParentName is null)
+            throw new SemanticError("'inherited' solo puede usarse dentro de un método de una clase con clase base", ic.Line, ic.Col);
+        if (!TryFindMethod(_currentClass.ParentName, ic.Member, out var method, out var owningClass))
+            throw new SemanticError($"la clase base no tiene un método '{ic.Member}'", ic.Line, ic.Col);
+        if (!method.ReturnType.HasValue)
+            throw new SemanticError($"'{ic.Member}' es un procedimiento y no puede usarse como expresión", ic.Line, ic.Col);
+        CheckMethodArgs(owningClass, ic.Member, method.Params, ic.Args, ic.Line, ic.Col);
+        return method.ReturnType.Value;
+    }
 
     // obj.Metodo() used as a value (must return a scalar). TClase.Create() is only valid
     // directly on the right-hand side of a class-typed assignment (see EmitAssign), so
@@ -922,8 +960,10 @@ public sealed class CodeGen
                 if (args[i] is not VarExpr ve)
                     throw new SemanticError($"el argumento {i + 1} de '{className}.{methodName}' debe ser una variable de tipo '{param.RecordType}'", line, col);
                 var argTarget = ResolveMemberTarget(ve.Name, ve.Line, ve.Col);
-                if (argTarget.RecordType != param.RecordType && argTarget.ClassType != param.RecordType)
-                    throw new SemanticError($"el argumento {i + 1} de '{className}.{methodName}' debe ser de tipo '{param.RecordType}'", line, col);
+                bool argMatches = argTarget.RecordType == param.RecordType
+                    || (argTarget.ClassType is not null && IsAssignableClass(argTarget.ClassType, param.RecordType));
+                if (!argMatches)
+                    throw new SemanticError($"el argumento {i + 1} de '{className}.{methodName}' debe ser de tipo '{param.RecordType}' (o una subclase)", line, col);
                 continue;
             }
 
@@ -965,6 +1005,20 @@ public sealed class CodeGen
         if (cls.ParentName is not null) return TryFindMethod(cls.ParentName, methodName, out method, out owningClass);
         method = null!;
         owningClass = "";
+        return false;
+    }
+
+    // Is sourceClass the same as, or a descendant of, targetClass? Lets a subclass
+    // instance be assigned/passed where a base-class reference is expected — the usual
+    // precondition for virtual dispatch to actually mean something.
+    private bool IsAssignableClass(string sourceClass, string targetClass)
+    {
+        string? current = sourceClass;
+        while (current is not null)
+        {
+            if (string.Equals(current, targetClass, StringComparison.OrdinalIgnoreCase)) return true;
+            current = _classTypes[current].ParentName;
+        }
         return false;
     }
 
@@ -1497,9 +1551,21 @@ public sealed class CodeGen
                 return TryEmitBuiltin(f, out var bt) ? bt : EmitCall(f);
             case QualifiedCallExpr qc:
                 return EmitQualifiedCallExpr(qc);
+            case InheritedCallExpr ic:
+                return EmitInheritedCallExpr(ic);
             default:
                 throw new InvalidOperationException("expresión no soportada");
         }
+    }
+
+    private PascalType EmitInheritedCallExpr(InheritedCallExpr ic)
+    {
+        var type = TypeOfInherited(ic); // validates
+        TryFindMethod(_currentClass!.ParentName!, ic.Member, out var method, out _);
+        _il.Emit(OpCodes.Ldarg_0); // Self
+        EmitMethodArgs(method.Params, ic.Args);
+        _il.Emit(OpCodes.Call, method.Method); // non-virtual: calls the base implementation directly
+        return type;
     }
 
     private PascalType EmitQualifiedCallExpr(QualifiedCallExpr qc)
@@ -1754,6 +1820,10 @@ public sealed class CodeGen
                 EmitQualifiedCallStmt(qc);
                 break;
 
+            case InheritedCallStmt ic:
+                EmitInheritedCallStmt(ic);
+                break;
+
             case EmptyStmt:
                 break;
 
@@ -1790,6 +1860,21 @@ public sealed class CodeGen
         target.EmitRef(); // Self
         EmitMethodArgs(method.Params, qc.Args);
         _il.Emit(OpCodes.Callvirt, method.Method);
+    }
+
+    private void EmitInheritedCallStmt(InheritedCallStmt ic)
+    {
+        if (_currentClass is null || _currentClass.ParentName is null)
+            throw new SemanticError("'inherited' solo puede usarse dentro de un método de una clase con clase base", ic.Line, ic.Col);
+        if (!TryFindMethod(_currentClass.ParentName, ic.Member, out var method, out var owningClass))
+            throw new SemanticError($"la clase base no tiene un método '{ic.Member}'", ic.Line, ic.Col);
+        if (method.ReturnType.HasValue)
+            throw new SemanticError($"'{ic.Member}' es una función; asigne su resultado a una variable en lugar de llamarla como instrucción", ic.Line, ic.Col);
+
+        CheckMethodArgs(owningClass, ic.Member, method.Params, ic.Args, ic.Line, ic.Col);
+        _il.Emit(OpCodes.Ldarg_0); // Self
+        EmitMethodArgs(method.Params, ic.Args);
+        _il.Emit(OpCodes.Call, method.Method); // non-virtual: calls the base implementation directly
     }
 
     private void EmitProcCall(ProcCallStmt call)
@@ -1849,7 +1934,7 @@ public sealed class CodeGen
             if (a.Value is VarExpr ve)
             {
                 var srcSlot = LookupVar(ve.Name, ve.Line, ve.Col);
-                if (srcSlot.ClassType != sym.ClassType)
+                if (srcSlot.ClassType is null || !IsAssignableClass(srcSlot.ClassType, sym.ClassType))
                     throw new SemanticError($"no se puede asignar '{ve.Name}' a '{a.Name}': son de tipos distintos", a.Line, a.Col);
                 EmitStoreTo(sym, () => EmitLoad(srcSlot));
                 return;
@@ -1904,7 +1989,9 @@ public sealed class CodeGen
             if (valueExpr is VarExpr ve)
             {
                 var srcTarget = ResolveMemberTarget(ve.Name, ve.Line, ve.Col);
-                if (srcTarget.RecordType != field.RecordType && srcTarget.ClassType != field.RecordType)
+                bool fieldMatches = srcTarget.RecordType == field.RecordType
+                    || (srcTarget.ClassType is not null && IsAssignableClass(srcTarget.ClassType, field.RecordType));
+                if (!fieldMatches)
                     throw new SemanticError($"no se puede asignar '{ve.Name}': es de un tipo distinto al del campo", line, col);
                 emitTargetRef();
                 srcTarget.EmitRef();
