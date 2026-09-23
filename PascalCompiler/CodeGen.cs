@@ -99,6 +99,8 @@ public sealed class CodeGen
     private sealed record ClassTypeInfo(
         TypeBuilder Type,
         ConstructorBuilder Ctor,
+        List<ParamDecl> CtorParams,
+        bool HasExplicitCtor,
         Dictionary<string, (FieldBuilder Field, PascalType Type, bool IsPrivate, string? RecordType)> Fields,
         Dictionary<string, ClassMethodInfo> Methods);
 
@@ -149,7 +151,24 @@ public sealed class CodeGen
                 throw new SemanticError($"el tipo '{ct.Name}' ya está declarado", ct.Line, ct.Col);
 
             var classTypeBuilder = moduleBuilder.DefineType(ct.Name, TypeAttributes.Public | TypeAttributes.Class);
-            var ctor = classTypeBuilder.DefineDefaultConstructor(MethodAttributes.Public);
+
+            ConstructorBuilder ctor;
+            List<ParamDecl> ctorParams;
+            if (ct.Ctor is not null)
+            {
+                // Explicit constructor: its body is compiled later, in CompileCtorImpl,
+                // once it's matched against a top-level 'constructor TFoo.Create(...)'.
+                var ctorParamTypes = ct.Ctor.Params.Select(ParamClrType).ToArray();
+                ctor = classTypeBuilder.DefineConstructor(MethodAttributes.Public, CallingConventions.Standard, ctorParamTypes);
+                for (int i = 0; i < ct.Ctor.Params.Count; i++)
+                    ctor.DefineParameter(i + 1, ParameterAttributes.None, ct.Ctor.Params[i].Name);
+                ctorParams = ct.Ctor.Params;
+            }
+            else
+            {
+                ctor = classTypeBuilder.DefineDefaultConstructor(MethodAttributes.Public);
+                ctorParams = new List<ParamDecl>();
+            }
 
             var fields = new Dictionary<string, (FieldBuilder, PascalType, bool, string?)>(StringComparer.OrdinalIgnoreCase);
             var seenField = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -199,7 +218,7 @@ public sealed class CodeGen
                 methods[m.Name] = new ClassMethodInfo(methodBuilder, m.ReturnType, m.Params, m.IsPrivate);
             }
 
-            _classTypes[ct.Name] = new ClassTypeInfo(classTypeBuilder, ctor, fields, methods);
+            _classTypes[ct.Name] = new ClassTypeInfo(classTypeBuilder, ctor, ctorParams, ct.Ctor is not null, fields, methods);
         }
 
         // Pass 1: declare all function/procedure signatures so calls (incl. recursive and forward) resolve.
@@ -263,6 +282,28 @@ public sealed class CodeGen
             foreach (var m in ct.Methods)
                 if (!seenImpl.Contains((ct.Name, m.Name)))
                     throw new SemanticError($"falta la implementación de '{ct.Name}.{m.Name}'", m.Line, m.Col);
+
+        // Pass 2.6: emit bodies for explicit constructors declared with 'constructor Create(...)'.
+        var seenCtorImpl = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var cimpl in program.CtorImpls)
+        {
+            if (!_classTypes.TryGetValue(cimpl.ClassName, out var classInfo))
+                throw new SemanticError($"la clase '{cimpl.ClassName}' no está declarada", cimpl.Line, cimpl.Col);
+            if (!classInfo.HasExplicitCtor)
+                throw new SemanticError($"'{cimpl.ClassName}' no declaró un 'constructor Create' en su definición de clase", cimpl.Line, cimpl.Col);
+            if (!seenCtorImpl.Add(cimpl.ClassName))
+                throw new SemanticError($"'{cimpl.ClassName}.Create' ya tiene una implementación", cimpl.Line, cimpl.Col);
+
+            bool paramsMatch = cimpl.Params.Count == classInfo.CtorParams.Count &&
+                cimpl.Params.Zip(classInfo.CtorParams).All(p => p.First.Type == p.Second.Type && p.First.ByRef == p.Second.ByRef);
+            if (!paramsMatch)
+                throw new SemanticError($"la implementación de '{cimpl.ClassName}.Create' no coincide con su firma declarada en la clase", cimpl.Line, cimpl.Col);
+
+            CompileCtorImpl(classInfo, cimpl);
+        }
+        foreach (var ct in program.ClassTypes)
+            if (ct.Ctor is not null && !seenCtorImpl.Contains(ct.Name))
+                throw new SemanticError($"falta la implementación de '{ct.Name}.Create'", ct.Ctor.Line, ct.Ctor.Col);
 
         // Pass 3: emit Main, which hosts the program's global vars and top-level statements.
         var mainMethod = typeBuilder.DefineMethod(
@@ -407,6 +448,43 @@ public sealed class CodeGen
 
         if (resultLocal is not null)
             _il.Emit(OpCodes.Ldloc, resultLocal);
+        _il.Emit(OpCodes.Ret);
+
+        _currentClass = null;
+    }
+
+    private void CompileCtorImpl(ClassTypeInfo classInfo, ClassCtorImplDecl cimpl)
+    {
+        _il = classInfo.Ctor.GetILGenerator();
+
+        // Chain to the base object constructor — DefineDefaultConstructor does this for
+        // us automatically, but an explicit constructor's body has to do it itself.
+        _il.Emit(OpCodes.Ldarg_0);
+        _il.Emit(OpCodes.Call, typeof(object).GetConstructor(Type.EmptyTypes)!);
+
+        _symbols = new Dictionary<string, VarSlot>(StringComparer.OrdinalIgnoreCase);
+        _currentClass = classInfo;
+
+        _symbols["Self"] = new VarSlot(PascalType.Void, SlotKind.Arg, null, 0, false, null, null, cimpl.ClassName);
+        for (int i = 0; i < cimpl.Params.Count; i++)
+        {
+            var p = cimpl.Params[i];
+            if (p.RecordType is not null)
+                _symbols[p.Name] = MakeNamedTypeSlot(p.RecordType, SlotKind.Arg, null, i + 1, p.Line, p.Col);
+            else if (p.Array is not null)
+                _symbols[p.Name] = new VarSlot(p.Array.ElementType, SlotKind.Arg, null, i + 1, false, p.Array);
+            else
+                _symbols[p.Name] = new VarSlot(p.Type, SlotKind.Arg, null, i + 1, p.ByRef);
+        }
+
+        foreach (var v in cimpl.Locals)
+        {
+            if (_symbols.ContainsKey(v.Name))
+                throw new SemanticError($"'{v.Name}' ya está declarado en '{cimpl.ClassName}.Create'", v.Line, v.Col);
+            DeclareLocalVar(v);
+        }
+
+        EmitStmt(cimpl.Body);
         _il.Emit(OpCodes.Ret);
 
         _currentClass = null;
@@ -1613,8 +1691,8 @@ public sealed class CodeGen
         {
             if (!string.Equals(qc.Member, "Create", StringComparison.OrdinalIgnoreCase))
                 throw new SemanticError($"solo se soporta '{qc.Target}.Create()' para construir instancias por ahora", qc.Line, qc.Col);
-            if (qc.Args.Count != 0)
-                throw new SemanticError("'Create' no admite argumentos todavía", qc.Line, qc.Col);
+            CheckMethodArgs(qc.Target, "Create", classInfoForCtor.CtorParams, qc.Args, qc.Line, qc.Col);
+            EmitMethodArgs(classInfoForCtor.CtorParams, qc.Args);
             _il.Emit(OpCodes.Newobj, classInfoForCtor.Ctor);
             _il.Emit(OpCodes.Pop); // discarded; usually you'd assign this to a variable instead
             return;
@@ -1701,9 +1779,13 @@ public sealed class CodeGen
             if (a.Value is QualifiedCallExpr qc && string.Equals(qc.Target, sym.ClassType, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(qc.Member, "Create", StringComparison.OrdinalIgnoreCase))
             {
-                if (qc.Args.Count != 0)
-                    throw new SemanticError("'Create' no admite argumentos todavía", a.Line, a.Col);
-                EmitStoreTo(sym, () => _il.Emit(OpCodes.Newobj, _classTypes[sym.ClassType].Ctor));
+                var ctorInfo = _classTypes[sym.ClassType];
+                CheckMethodArgs(sym.ClassType, "Create", ctorInfo.CtorParams, qc.Args, a.Line, a.Col);
+                EmitStoreTo(sym, () =>
+                {
+                    EmitMethodArgs(ctorInfo.CtorParams, qc.Args);
+                    _il.Emit(OpCodes.Newobj, ctorInfo.Ctor);
+                });
                 return;
             }
             throw new SemanticError($"solo se puede asignar un objeto a partir de otra variable del mismo tipo o '{sym.ClassType}.Create()'", a.Line, a.Col);
@@ -1756,9 +1838,9 @@ public sealed class CodeGen
                 && string.Equals(qc.Member, "Create", StringComparison.OrdinalIgnoreCase)
                 && _classTypes.TryGetValue(field.RecordType, out var ctorClassInfo))
             {
-                if (qc.Args.Count != 0)
-                    throw new SemanticError("'Create' no admite argumentos todavía", line, col);
+                CheckMethodArgs(field.RecordType, "Create", ctorClassInfo.CtorParams, qc.Args, line, col);
                 emitTargetRef();
+                EmitMethodArgs(ctorClassInfo.CtorParams, qc.Args);
                 _il.Emit(OpCodes.Newobj, ctorClassInfo.Ctor);
                 _il.Emit(OpCodes.Stfld, field.Field);
                 return;
