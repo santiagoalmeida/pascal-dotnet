@@ -7,6 +7,7 @@ public enum TokenType
     Div, Mod, And, Or, Not,
     ForKw, ToKw, DownToKw, FunctionKw, ProcedureKw, CaseKw, OfKw, ConstKw, ReadLnKw, ArrayKw,
     TypeKw, RecordKw, ClassKw,
+    PrivateKw, PublicKw, ConstructorKw, VirtualKw, OverrideKw, InheritedKw,
 
     Semi, Colon, Comma, Dot, DotDot, Assign,
     Plus, Minus, Star, Slash, LParen, RParen, LBracket, RBracket,

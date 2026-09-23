@@ -38,6 +38,7 @@ public sealed class Parser
         var recordTypes = new List<RecordTypeDecl>();
         var classTypes = new List<ClassTypeDecl>();
         var methodImpls = new List<MethodImplDecl>();
+        var ctorImpls = new List<ClassCtorImplDecl>();
 
         while (true)
         {
@@ -53,6 +54,10 @@ public sealed class Parser
             {
                 ParseFunctionOrMethod(subs, methodImpls);
             }
+            else if (Current.Type == TokenType.ConstructorKw)
+            {
+                ctorImpls.Add(ParseCtorImpl());
+            }
             else
             {
                 break;
@@ -63,7 +68,7 @@ public sealed class Parser
         Expect(TokenType.Dot, "'.' al final del programa");
         Expect(TokenType.Eof, "fin de archivo");
 
-        return new PascalProgram(name, vars, subs, recordTypes, classTypes, methodImpls, body);
+        return new PascalProgram(name, vars, subs, recordTypes, classTypes, methodImpls, ctorImpls, body);
     }
 
     private void ParseTypeSection(List<RecordTypeDecl> recordTypes, List<ClassTypeDecl> classTypes)
@@ -94,12 +99,43 @@ public sealed class Parser
             }
             else if (Match(TokenType.ClassKw))
             {
+                string? parentName = null;
+                if (Match(TokenType.LParen))
+                {
+                    parentName = Expect(TokenType.Identifier, "el nombre de la clase base").Text;
+                    Expect(TokenType.RParen, "')'");
+                }
+
                 var fields = new List<ClassField>();
                 var methods = new List<ClassMethodSig>();
+                ClassCtorSig? ctorSig = null;
+                bool isPrivate = false;
+
                 while (Current.Type == TokenType.Identifier
                     || Current.Type == TokenType.FunctionKw
-                    || Current.Type == TokenType.ProcedureKw)
+                    || Current.Type == TokenType.ProcedureKw
+                    || Current.Type == TokenType.ConstructorKw
+                    || Current.Type == TokenType.PrivateKw
+                    || Current.Type == TokenType.PublicKw)
                 {
+                    if (Current.Type == TokenType.PrivateKw) { _pos++; isPrivate = true; continue; }
+                    if (Current.Type == TokenType.PublicKw) { _pos++; isPrivate = false; continue; }
+
+                    if (Current.Type == TokenType.ConstructorKw)
+                    {
+                        var ckw = Current;
+                        _pos++;
+                        var cname = Expect(TokenType.Identifier, "'Create'").Text;
+                        if (!string.Equals(cname, "Create", StringComparison.OrdinalIgnoreCase))
+                            throw new ParseError("el único constructor soportado se llama 'Create'", ckw.Line, ckw.Col);
+                        if (ctorSig is not null)
+                            throw new ParseError("ya se declaró un constructor 'Create' en esta clase", ckw.Line, ckw.Col);
+                        var cparams = ParseParamList();
+                        Expect(TokenType.Semi, "';'");
+                        ctorSig = new ClassCtorSig(cparams, ckw.Line, ckw.Col);
+                        continue;
+                    }
+
                     if (Current.Type == TokenType.FunctionKw || Current.Type == TokenType.ProcedureKw)
                     {
                         bool isFunc = Current.Type == TokenType.FunctionKw;
@@ -114,7 +150,12 @@ public sealed class Parser
                             mret = ParseType();
                         }
                         Expect(TokenType.Semi, "';'");
-                        methods.Add(new ClassMethodSig(mname, mparams, mret, mkw.Line, mkw.Col));
+
+                        bool isVirtual = false, isOverride = false;
+                        if (Match(TokenType.VirtualKw)) { isVirtual = true; Expect(TokenType.Semi, "';'"); }
+                        else if (Match(TokenType.OverrideKw)) { isOverride = true; Expect(TokenType.Semi, "';'"); }
+
+                        methods.Add(new ClassMethodSig(mname, mparams, mret, mkw.Line, mkw.Col, isPrivate, isVirtual, isOverride));
                     }
                     else
                     {
@@ -122,21 +163,34 @@ public sealed class Parser
                         while (Match(TokenType.Comma))
                             names.Add(Expect(TokenType.Identifier, "un identificador"));
                         Expect(TokenType.Colon, "':'");
-                        var fieldType = ParseType();
+                        var (fieldType, fieldRecordType) = ParseClassFieldType();
                         Expect(TokenType.Semi, "';'");
                         foreach (var n in names)
-                            fields.Add(new ClassField(n.Text, fieldType, n.Line, n.Col));
+                            fields.Add(new ClassField(n.Text, fieldType, n.Line, n.Col, isPrivate, fieldRecordType));
                     }
                 }
                 Expect(TokenType.End, "'end'");
                 Expect(TokenType.Semi, "';'");
-                classTypes.Add(new ClassTypeDecl(nameTok.Text, fields, methods, nameTok.Line, nameTok.Col));
+                classTypes.Add(new ClassTypeDecl(nameTok.Text, parentName, fields, methods, ctorSig, nameTok.Line, nameTok.Col));
             }
             else
             {
                 throw new ParseError("se esperaba 'record' o 'class'", Current.Line, Current.Col);
             }
         }
+    }
+
+    // A class field's type: either a simple scalar type, or a bare identifier naming
+    // another record/class type (composition) — no arrays as class fields.
+    private (PascalType Type, string? RecordType) ParseClassFieldType()
+    {
+        if (Current.Type == TokenType.Identifier)
+        {
+            var name = Current.Text;
+            _pos++;
+            return (PascalType.Void, name);
+        }
+        return (ParseType(), null);
     }
 
     private List<ParamDecl> ParseParamList()
@@ -292,6 +346,29 @@ public sealed class Parser
         subs.Add(new SubDecl(firstName, parameters, returnType, returnRecordType, locals, body, kw.Line, kw.Col));
     }
 
+    // constructor ClassName.Create(...); [var ...] begin ... end;
+    private ClassCtorImplDecl ParseCtorImpl()
+    {
+        var kw = Expect(TokenType.ConstructorKw, "'constructor'");
+        var className = Expect(TokenType.Identifier, "un identificador").Text;
+        Expect(TokenType.Dot, "'.'");
+        var ctorName = Expect(TokenType.Identifier, "'Create'").Text;
+        if (!string.Equals(ctorName, "Create", StringComparison.OrdinalIgnoreCase))
+            throw new ParseError("el único constructor soportado se llama 'Create'", kw.Line, kw.Col);
+
+        var cParams = ParseParamList();
+        Expect(TokenType.Semi, "';'");
+
+        var cLocals = new List<VarDecl>();
+        if (Current.Type == TokenType.VarKw)
+            cLocals = ParseVarSection();
+
+        var cBody = ParseCompoundStatement();
+        Expect(TokenType.Semi, "';' después de la declaración");
+
+        return new ClassCtorImplDecl(className, cParams, cLocals, cBody, kw.Line, kw.Col);
+    }
+
     private List<ParamDecl> ParseParam()
     {
         bool byRef = false;
@@ -342,6 +419,8 @@ public sealed class Parser
                 return ParseWrite(TokenType.Write, newline: false);
             case TokenType.ReadLnKw:
                 return ParseReadLn();
+            case TokenType.InheritedKw:
+                return ParseInheritedStmt();
             case TokenType.Identifier:
                 return ParseIdentifierStatement();
             case TokenType.End:
@@ -408,6 +487,42 @@ public sealed class Parser
             Expect(TokenType.RParen, "')'");
         }
         return new ProcCallStmt(id.Text, args, id.Line, id.Col);
+    }
+
+    private Stmt ParseInheritedStmt()
+    {
+        var kw = Expect(TokenType.InheritedKw, "'inherited'");
+        var member = Expect(TokenType.Identifier, "un nombre de método").Text;
+        var args = new List<Expr>();
+        if (Match(TokenType.LParen))
+        {
+            if (Current.Type != TokenType.RParen)
+            {
+                args.Add(ParseExpr());
+                while (Match(TokenType.Comma))
+                    args.Add(ParseExpr());
+            }
+            Expect(TokenType.RParen, "')'");
+        }
+        return new InheritedCallStmt(member, args, kw.Line, kw.Col);
+    }
+
+    private Expr ParseInheritedExpr()
+    {
+        var kw = Expect(TokenType.InheritedKw, "'inherited'");
+        var member = Expect(TokenType.Identifier, "un nombre de método").Text;
+        var args = new List<Expr>();
+        if (Match(TokenType.LParen))
+        {
+            if (Current.Type != TokenType.RParen)
+            {
+                args.Add(ParseExpr());
+                while (Match(TokenType.Comma))
+                    args.Add(ParseExpr());
+            }
+            Expect(TokenType.RParen, "')'");
+        }
+        return new InheritedCallExpr(member, args, kw.Line, kw.Col);
     }
 
     private Stmt ParseIf()
@@ -603,6 +718,8 @@ public sealed class Parser
             case TokenType.FalseKw:
                 _pos++;
                 return new BoolLiteralExpr(false);
+            case TokenType.InheritedKw:
+                return ParseInheritedExpr();
             case TokenType.Identifier:
             {
                 _pos++;

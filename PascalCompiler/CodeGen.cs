@@ -94,12 +94,12 @@ public sealed class CodeGen
         ConstructorBuilder Ctor,
         Dictionary<string, (FieldBuilder Field, PascalType Type)> Fields);
 
-    private sealed record ClassMethodInfo(MethodBuilder Method, PascalType? ReturnType, List<ParamDecl> Params);
+    private sealed record ClassMethodInfo(MethodBuilder Method, PascalType? ReturnType, List<ParamDecl> Params, bool IsPrivate);
 
     private sealed record ClassTypeInfo(
         TypeBuilder Type,
         ConstructorBuilder Ctor,
-        Dictionary<string, (FieldBuilder Field, PascalType Type)> Fields,
+        Dictionary<string, (FieldBuilder Field, PascalType Type, bool IsPrivate)> Fields,
         Dictionary<string, ClassMethodInfo> Methods);
 
     private ILGenerator _il = null!;
@@ -151,14 +151,14 @@ public sealed class CodeGen
             var classTypeBuilder = moduleBuilder.DefineType(ct.Name, TypeAttributes.Public | TypeAttributes.Class);
             var ctor = classTypeBuilder.DefineDefaultConstructor(MethodAttributes.Public);
 
-            var fields = new Dictionary<string, (FieldBuilder, PascalType)>(StringComparer.OrdinalIgnoreCase);
+            var fields = new Dictionary<string, (FieldBuilder, PascalType, bool)>(StringComparer.OrdinalIgnoreCase);
             var seenField = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var f in ct.Fields)
             {
                 if (!seenField.Add(f.Name))
                     throw new SemanticError($"el campo '{f.Name}' ya está declarado en '{ct.Name}'", f.Line, f.Col);
                 var fb = classTypeBuilder.DefineField(f.Name, ClrType(f.Type), FieldAttributes.Public);
-                fields[f.Name] = (fb, f.Type);
+                fields[f.Name] = (fb, f.Type, f.IsPrivate);
             }
 
             var methods = new Dictionary<string, ClassMethodInfo>(StringComparer.OrdinalIgnoreCase);
@@ -181,7 +181,7 @@ public sealed class CodeGen
                 for (int i = 0; i < m.Params.Count; i++)
                     methodBuilder.DefineParameter(i + 1, ParameterAttributes.None, m.Params[i].Name);
 
-                methods[m.Name] = new ClassMethodInfo(methodBuilder, m.ReturnType, m.Params);
+                methods[m.Name] = new ClassMethodInfo(methodBuilder, m.ReturnType, m.Params, m.IsPrivate);
             }
 
             _classTypes[ct.Name] = new ClassTypeInfo(classTypeBuilder, ctor, fields, methods);
@@ -735,6 +735,7 @@ public sealed class CodeGen
         var classInfo = _classTypes[slot.ClassType];
         if (!classInfo.Methods.TryGetValue(qc.Member, out var method))
             throw new SemanticError($"'{slot.ClassType}' no tiene un método '{qc.Member}'", qc.Line, qc.Col);
+        CheckAccessible(slot.ClassType, method.IsPrivate, qc.Member, qc.Line, qc.Col);
         if (!method.ReturnType.HasValue)
             throw new SemanticError($"'{qc.Member}' es un procedimiento y no puede usarse como expresión", qc.Line, qc.Col);
 
@@ -756,21 +757,31 @@ public sealed class CodeGen
         }
     }
 
+    // A private field/method is only accessible from inside a method of the same class
+    // that declares it (no protected/friend-class nuance — just "am I inside className?").
+    private void CheckAccessible(string className, bool isPrivate, string memberName, int line, int col)
+    {
+        if (!isPrivate) return;
+        if (_currentClass is null || !string.Equals(_currentClass.Type.Name, className, StringComparison.OrdinalIgnoreCase))
+            throw new SemanticError($"'{memberName}' es privado en '{className}' y no es accesible desde aquí", line, col);
+    }
+
     // Resolves a field regardless of whether the slot holds a record or a class instance.
-    private (FieldBuilder Field, PascalType Type) ResolveField(VarSlot slot, string fieldName, string varName, int line, int col)
+    private (FieldBuilder Field, PascalType Type, bool IsPrivate) ResolveField(VarSlot slot, string fieldName, string varName, int line, int col)
     {
         if (slot.RecordType is not null)
         {
             var rec = _recordTypes[slot.RecordType];
-            if (!rec.Fields.TryGetValue(fieldName, out var field))
+            if (!rec.Fields.TryGetValue(fieldName, out var recField))
                 throw new SemanticError($"'{varName}' no tiene un campo '{fieldName}'", line, col);
-            return field;
+            return (recField.Field, recField.Type, false); // records have no privacy
         }
         if (slot.ClassType is not null)
         {
             var cls = _classTypes[slot.ClassType];
             if (!cls.Fields.TryGetValue(fieldName, out var field))
                 throw new SemanticError($"'{varName}' no tiene un campo '{fieldName}'", line, col);
+            CheckAccessible(slot.ClassType, field.IsPrivate, fieldName, line, col);
             return field;
         }
         throw new SemanticError($"'{varName}' no es un record ni un objeto", line, col);
@@ -1539,6 +1550,7 @@ public sealed class CodeGen
         var classInfo = _classTypes[slot.ClassType];
         if (!classInfo.Methods.TryGetValue(qc.Member, out var method))
             throw new SemanticError($"'{slot.ClassType}' no tiene un método '{qc.Member}'", qc.Line, qc.Col);
+        CheckAccessible(slot.ClassType, method.IsPrivate, qc.Member, qc.Line, qc.Col);
         if (method.ReturnType.HasValue)
             throw new SemanticError($"'{qc.Member}' es una función; asigne su resultado a una variable en lugar de llamarla como instrucción", qc.Line, qc.Col);
 

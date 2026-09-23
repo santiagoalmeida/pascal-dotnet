@@ -43,6 +43,12 @@ public sealed class Lexer
         ["type"] = TokenType.TypeKw,
         ["record"] = TokenType.RecordKw,
         ["class"] = TokenType.ClassKw,
+        ["private"] = TokenType.PrivateKw,
+        ["public"] = TokenType.PublicKw,
+        ["constructor"] = TokenType.ConstructorKw,
+        ["virtual"] = TokenType.VirtualKw,
+        ["override"] = TokenType.OverrideKw,
+        ["inherited"] = TokenType.InheritedKw,
     };
 
     private readonly string _src;

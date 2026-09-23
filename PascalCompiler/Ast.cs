@@ -10,15 +10,42 @@ public sealed record ArrayInfo(PascalType ElementType, int Low, int High, int? L
 public sealed record RecordField(string Name, PascalType Type, int Line, int Col);
 public sealed record RecordTypeDecl(string Name, List<RecordField> Fields, int Line, int Col);
 
-public sealed record ClassField(string Name, PascalType Type, int Line, int Col);
-public sealed record ClassMethodSig(string Name, List<ParamDecl> Params, PascalType? ReturnType, int Line, int Col);
-public sealed record ClassTypeDecl(string Name, List<ClassField> Fields, List<ClassMethodSig> Methods, int Line, int Col);
+// ClassField.RecordType: like VarDecl.RecordType, an optional named-type reference
+// (record or class) for composition fields — e.g. "logger: TLogger" inside a class.
+public sealed record ClassField(string Name, PascalType Type, int Line, int Col, bool IsPrivate = false, string? RecordType = null);
+public sealed record ClassMethodSig(
+    string Name,
+    List<ParamDecl> Params,
+    PascalType? ReturnType,
+    int Line,
+    int Col,
+    bool IsPrivate = false,
+    bool IsVirtual = false,
+    bool IsOverride = false);
+public sealed record ClassCtorSig(List<ParamDecl> Params, int Line, int Col);
+
+public sealed record ClassTypeDecl(
+    string Name,
+    string? ParentName,
+    List<ClassField> Fields,
+    List<ClassMethodSig> Methods,
+    ClassCtorSig? Ctor,
+    int Line,
+    int Col);
 
 public sealed record MethodImplDecl(
     string ClassName,
     string MethodName,
     List<ParamDecl> Params,
     PascalType? ReturnType,
+    List<VarDecl> Locals,
+    CompoundStmt Body,
+    int Line,
+    int Col);
+
+public sealed record ClassCtorImplDecl(
+    string ClassName,
+    List<ParamDecl> Params,
     List<VarDecl> Locals,
     CompoundStmt Body,
     int Line,
@@ -42,6 +69,10 @@ public sealed record FuncCallExpr(string Name, List<Expr> Args, int Line, int Co
 // by checking whether Target names a declared class type or a variable.
 public sealed record QualifiedCallExpr(string Target, string Member, List<Expr> Args, int Line, int Col) : Expr;
 
+// inherited MethodName(args) — calls the base class's implementation directly
+// (non-virtual dispatch), from within an overriding method.
+public sealed record InheritedCallExpr(string Member, List<Expr> Args, int Line, int Col) : Expr;
+
 public abstract record Stmt;
 
 public sealed record AssignStmt(string Name, Expr Value, int Line, int Col) : Stmt;
@@ -55,6 +86,7 @@ public sealed record WriteLnStmt(List<Expr> Args, bool Newline) : Stmt;
 public sealed record ReadLnStmt : Stmt;
 public sealed record ProcCallStmt(string Name, List<Expr> Args, int Line, int Col) : Stmt;
 public sealed record QualifiedCallStmt(string Target, string Member, List<Expr> Args, int Line, int Col) : Stmt;
+public sealed record InheritedCallStmt(string Member, List<Expr> Args, int Line, int Col) : Stmt;
 public sealed record EmptyStmt : Stmt;
 
 public sealed record CaseBranch(List<Expr> Labels, Stmt Body);
@@ -83,4 +115,5 @@ public sealed record PascalProgram(
     List<RecordTypeDecl> RecordTypes,
     List<ClassTypeDecl> ClassTypes,
     List<MethodImplDecl> MethodImpls,
+    List<ClassCtorImplDecl> CtorImpls,
     CompoundStmt Body);
