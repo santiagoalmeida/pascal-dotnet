@@ -101,6 +101,7 @@ public sealed class CodeGen
         ConstructorBuilder Ctor,
         List<ParamDecl> CtorParams,
         bool HasExplicitCtor,
+        string? ParentName,
         Dictionary<string, (FieldBuilder Field, PascalType Type, bool IsPrivate, string? RecordType)> Fields,
         Dictionary<string, ClassMethodInfo> Methods);
 
@@ -152,6 +153,17 @@ public sealed class CodeGen
 
             var classTypeBuilder = moduleBuilder.DefineType(ct.Name, TypeAttributes.Public | TypeAttributes.Class);
 
+            if (ct.ParentName is not null)
+            {
+                // The parent must already be declared (earlier in the file) — no forward
+                // references across class declarations for v1.
+                if (!_classTypes.TryGetValue(ct.ParentName, out var parentInfo))
+                    throw new SemanticError($"la clase base '{ct.ParentName}' no está declarada", ct.Line, ct.Col);
+                // SetParent before defining the constructor: DefineDefaultConstructor bakes
+                // in a call to the parent's parameterless ctor at the time it's called.
+                classTypeBuilder.SetParent(parentInfo.Type);
+            }
+
             ConstructorBuilder ctor;
             List<ParamDecl> ctorParams;
             if (ct.Ctor is not null)
@@ -166,7 +178,30 @@ public sealed class CodeGen
             }
             else
             {
-                ctor = classTypeBuilder.DefineDefaultConstructor(MethodAttributes.Public);
+                // No explicit constructor: emit a trivial parameterless one ourselves —
+                // NOT via DefineDefaultConstructor, which eagerly resolves the parent's
+                // ctor via reflection and fails while the parent is still a TypeBuilder
+                // (not yet CreateType()-ed). Referencing our own ConstructorBuilder for
+                // the parent's ctor directly sidesteps that.
+                ConstructorInfo baseCtor;
+                if (ct.ParentName is not null)
+                {
+                    var parentInfo = _classTypes[ct.ParentName];
+                    if (parentInfo.CtorParams.Count > 0)
+                        throw new SemanticError(
+                            $"la clase base '{ct.ParentName}' tiene un constructor con parámetros; '{ct.Name}' debe declarar su propio 'constructor Create'", ct.Line, ct.Col);
+                    baseCtor = parentInfo.Ctor;
+                }
+                else
+                {
+                    baseCtor = typeof(object).GetConstructor(Type.EmptyTypes)!;
+                }
+
+                ctor = classTypeBuilder.DefineConstructor(MethodAttributes.Public, CallingConventions.Standard, Type.EmptyTypes);
+                var ctorIl = ctor.GetILGenerator();
+                ctorIl.Emit(OpCodes.Ldarg_0);
+                ctorIl.Emit(OpCodes.Call, baseCtor);
+                ctorIl.Emit(OpCodes.Ret);
                 ctorParams = new List<ParamDecl>();
             }
 
@@ -176,6 +211,8 @@ public sealed class CodeGen
             {
                 if (!seenField.Add(f.Name))
                     throw new SemanticError($"el campo '{f.Name}' ya está declarado en '{ct.Name}'", f.Line, f.Col);
+                if (ct.ParentName is not null && TryFindField(ct.ParentName, f.Name, out _, out var fOwner))
+                    throw new SemanticError($"'{f.Name}' ya está declarado en la clase base '{fOwner}'", f.Line, f.Col);
 
                 if (f.RecordType is not null)
                 {
@@ -203,6 +240,8 @@ public sealed class CodeGen
                     throw new SemanticError($"el método '{m.Name}' ya está declarado en '{ct.Name}'", m.Line, m.Col);
                 if (fields.ContainsKey(m.Name))
                     throw new SemanticError($"'{m.Name}' ya está declarado como campo en '{ct.Name}'", m.Line, m.Col);
+                if (ct.ParentName is not null && TryFindMethod(ct.ParentName, m.Name, out _, out var mOwner))
+                    throw new SemanticError($"'{m.Name}' ya está declarado en la clase base '{mOwner}'", m.Line, m.Col);
 
                 var mParamTypes = m.Params.Select(ParamClrType).ToArray();
                 var mReturnClr = m.ReturnType.HasValue ? ClrType(m.ReturnType.Value) : typeof(void);
@@ -218,7 +257,7 @@ public sealed class CodeGen
                 methods[m.Name] = new ClassMethodInfo(methodBuilder, m.ReturnType, m.Params, m.IsPrivate);
             }
 
-            _classTypes[ct.Name] = new ClassTypeInfo(classTypeBuilder, ctor, ctorParams, ct.Ctor is not null, fields, methods);
+            _classTypes[ct.Name] = new ClassTypeInfo(classTypeBuilder, ctor, ctorParams, ct.Ctor is not null, ct.ParentName, fields, methods);
         }
 
         // Pass 1: declare all function/procedure signatures so calls (incl. recursive and forward) resolve.
@@ -457,10 +496,21 @@ public sealed class CodeGen
     {
         _il = classInfo.Ctor.GetILGenerator();
 
-        // Chain to the base object constructor — DefineDefaultConstructor does this for
-        // us automatically, but an explicit constructor's body has to do it itself.
+        // Chain to the base constructor ourselves (an auto-generated default constructor
+        // does this on its own; an explicit one has to do it explicitly).
         _il.Emit(OpCodes.Ldarg_0);
-        _il.Emit(OpCodes.Call, typeof(object).GetConstructor(Type.EmptyTypes)!);
+        if (classInfo.ParentName is not null)
+        {
+            var parentInfo = _classTypes[classInfo.ParentName];
+            if (parentInfo.CtorParams.Count > 0)
+                throw new SemanticError(
+                    $"la clase base '{classInfo.ParentName}' tiene un constructor con parámetros; encadenarlo automáticamente ('inherited Create') no está soportado todavía", cimpl.Line, cimpl.Col);
+            _il.Emit(OpCodes.Call, parentInfo.Ctor);
+        }
+        else
+        {
+            _il.Emit(OpCodes.Call, typeof(object).GetConstructor(Type.EmptyTypes)!);
+        }
 
         _symbols = new Dictionary<string, VarSlot>(StringComparer.OrdinalIgnoreCase);
         _currentClass = classInfo;
@@ -754,10 +804,12 @@ public sealed class CodeGen
     // by name (without an index / field) is a distinct kind of expression in this language.
     private PascalType TypeOfVar(VarExpr v)
     {
-        if (!_symbols.ContainsKey(v.Name) && _currentClass is not null && _currentClass.Fields.TryGetValue(v.Name, out var implicitField))
+        if (!_symbols.ContainsKey(v.Name) && _currentClass is not null
+            && TryFindField(_currentClass.Type.Name, v.Name, out var implicitField, out var implicitOwner))
         {
             if (implicitField.RecordType is not null)
                 throw new SemanticError($"'{v.Name}' es un objeto/record; usa '{v.Name}.campo' o '{v.Name}.Metodo()'", v.Line, v.Col);
+            CheckAccessible(implicitOwner, implicitField.IsPrivate, v.Name, v.Line, v.Col);
             return implicitField.Type; // unqualified field access inside a method body (implicit Self.name)
         }
 
@@ -829,14 +881,13 @@ public sealed class CodeGen
         if (target.ClassType is null)
             throw new SemanticError($"'{qc.Target}' no es un objeto", qc.Line, qc.Col);
 
-        var classInfo = _classTypes[target.ClassType];
-        if (!classInfo.Methods.TryGetValue(qc.Member, out var method))
+        if (!TryFindMethod(target.ClassType, qc.Member, out var method, out var owningClass))
             throw new SemanticError($"'{target.ClassType}' no tiene un método '{qc.Member}'", qc.Line, qc.Col);
-        CheckAccessible(target.ClassType, method.IsPrivate, qc.Member, qc.Line, qc.Col);
+        CheckAccessible(owningClass, method.IsPrivate, qc.Member, qc.Line, qc.Col);
         if (!method.ReturnType.HasValue)
             throw new SemanticError($"'{qc.Member}' es un procedimiento y no puede usarse como expresión", qc.Line, qc.Col);
 
-        CheckMethodArgs(target.ClassType, qc.Member, method.Params, qc.Args, qc.Line, qc.Col);
+        CheckMethodArgs(owningClass, qc.Member, method.Params, qc.Args, qc.Line, qc.Col);
         return method.ReturnType.Value;
     }
 
@@ -892,6 +943,31 @@ public sealed class CodeGen
             throw new SemanticError($"'{memberName}' es privado en '{className}' y no es accesible desde aquí", line, col);
     }
 
+    // Walks up the inheritance chain looking for a field/method, since a class's own
+    // Fields/Methods dict only holds what it declares itself (the CLR's own member
+    // inheritance handles storage/dispatch; these just mirror that for the compiler).
+    private bool TryFindField(
+        string className, string fieldName,
+        out (FieldBuilder Field, PascalType Type, bool IsPrivate, string? RecordType) field, out string owningClass)
+    {
+        var cls = _classTypes[className];
+        if (cls.Fields.TryGetValue(fieldName, out field)) { owningClass = className; return true; }
+        if (cls.ParentName is not null) return TryFindField(cls.ParentName, fieldName, out field, out owningClass);
+        field = default;
+        owningClass = "";
+        return false;
+    }
+
+    private bool TryFindMethod(string className, string methodName, out ClassMethodInfo method, out string owningClass)
+    {
+        var cls = _classTypes[className];
+        if (cls.Methods.TryGetValue(methodName, out method!)) { owningClass = className; return true; }
+        if (cls.ParentName is not null) return TryFindMethod(cls.ParentName, methodName, out method, out owningClass);
+        method = null!;
+        owningClass = "";
+        return false;
+    }
+
     // A record/object "receiver" for member access (obj.field, obj.Method()) or for
     // passing as a named-type argument — either a real local/param variable, or (inside
     // a method body) an implicit Self.field when the name isn't a local/param.
@@ -905,10 +981,11 @@ public sealed class CodeGen
                 throw new SemanticError($"'{name}' no es un record ni un objeto", line, col);
             return new MemberTarget(slot.RecordType, slot.ClassType, () => EmitLoad(slot));
         }
-        if (_currentClass is not null && _currentClass.Fields.TryGetValue(name, out var field))
+        if (_currentClass is not null && TryFindField(_currentClass.Type.Name, name, out var field, out var owningClass))
         {
             if (field.RecordType is null)
                 throw new SemanticError($"'{name}' no es un record ni un objeto", line, col);
+            CheckAccessible(owningClass, field.IsPrivate, name, line, col);
             var fb = field.Field;
             string? fRecordType = _recordTypes.ContainsKey(field.RecordType) ? field.RecordType : null;
             string? fClassType = _classTypes.ContainsKey(field.RecordType) ? field.RecordType : null;
@@ -921,7 +998,8 @@ public sealed class CodeGen
         throw new SemanticError($"variable '{name}' no declarada", line, col);
     }
 
-    // Resolves a field regardless of whether the receiver is a record or a class instance.
+    // Resolves a field regardless of whether the receiver is a record or a class instance,
+    // walking up the inheritance chain for a class receiver.
     private (FieldBuilder Field, PascalType Type, bool IsPrivate, string? RecordType) ResolveField(
         string? recordType, string? classType, string fieldName, string varName, int line, int col)
     {
@@ -934,10 +1012,9 @@ public sealed class CodeGen
         }
         if (classType is not null)
         {
-            var cls = _classTypes[classType];
-            if (!cls.Fields.TryGetValue(fieldName, out var field))
+            if (!TryFindField(classType, fieldName, out var field, out var owningClass))
                 throw new SemanticError($"'{varName}' no tiene un campo '{fieldName}'", line, col);
-            CheckAccessible(classType, field.IsPrivate, fieldName, line, col);
+            CheckAccessible(owningClass, field.IsPrivate, fieldName, line, col);
             return field;
         }
         throw new SemanticError($"'{varName}' no es un record ni un objeto", line, col);
@@ -1398,10 +1475,11 @@ public sealed class CodeGen
             case VarExpr v:
             {
                 var type = TypeOfVar(v); // validates it's a plain scalar, not an array/record/object
-                if (!_symbols.ContainsKey(v.Name) && _currentClass is not null)
+                if (!_symbols.ContainsKey(v.Name) && _currentClass is not null
+                    && TryFindField(_currentClass.Type.Name, v.Name, out var implicitField, out _))
                 {
                     _il.Emit(OpCodes.Ldarg_0); // Self
-                    _il.Emit(OpCodes.Ldfld, _currentClass.Fields[v.Name].Field);
+                    _il.Emit(OpCodes.Ldfld, implicitField.Field);
                     return type;
                 }
                 EmitLoad(LookupVar(v.Name, v.Line, v.Col));
@@ -1428,8 +1506,7 @@ public sealed class CodeGen
     {
         var type = TypeOfQualified(qc); // validates
         var target = ResolveMemberTarget(qc.Target, qc.Line, qc.Col);
-        var classInfo = _classTypes[target.ClassType!];
-        var method = classInfo.Methods[qc.Member];
+        TryFindMethod(target.ClassType!, qc.Member, out var method, out _);
 
         target.EmitRef(); // Self
         EmitMethodArgs(method.Params, qc.Args);
@@ -1702,14 +1779,13 @@ public sealed class CodeGen
         if (target.ClassType is null)
             throw new SemanticError($"'{qc.Target}' no es un objeto", qc.Line, qc.Col);
 
-        var classInfo = _classTypes[target.ClassType];
-        if (!classInfo.Methods.TryGetValue(qc.Member, out var method))
+        if (!TryFindMethod(target.ClassType, qc.Member, out var method, out var owningClass))
             throw new SemanticError($"'{target.ClassType}' no tiene un método '{qc.Member}'", qc.Line, qc.Col);
-        CheckAccessible(target.ClassType, method.IsPrivate, qc.Member, qc.Line, qc.Col);
+        CheckAccessible(owningClass, method.IsPrivate, qc.Member, qc.Line, qc.Col);
         if (method.ReturnType.HasValue)
             throw new SemanticError($"'{qc.Member}' es una función; asigne su resultado a una variable en lugar de llamarla como instrucción", qc.Line, qc.Col);
 
-        CheckMethodArgs(target.ClassType, qc.Member, method.Params, qc.Args, qc.Line, qc.Col);
+        CheckMethodArgs(owningClass, qc.Member, method.Params, qc.Args, qc.Line, qc.Col);
 
         target.EmitRef(); // Self
         EmitMethodArgs(method.Params, qc.Args);
@@ -1731,9 +1807,11 @@ public sealed class CodeGen
 
     private void EmitAssign(AssignStmt a)
     {
-        if (!_symbols.ContainsKey(a.Name) && _currentClass is not null && _currentClass.Fields.TryGetValue(a.Name, out var implicitField))
+        if (!_symbols.ContainsKey(a.Name) && _currentClass is not null
+            && TryFindField(_currentClass.Type.Name, a.Name, out var implicitField, out var implicitOwner))
         {
             // Unqualified assignment inside a method body (implicit Self.name := ...).
+            CheckAccessible(implicitOwner, implicitField.IsPrivate, a.Name, a.Line, a.Col);
             EmitAssignToField(() => _il.Emit(OpCodes.Ldarg_0), implicitField, a.Value, a.Line, a.Col);
             return;
         }
