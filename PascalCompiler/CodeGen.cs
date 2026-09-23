@@ -57,6 +57,34 @@ public sealed class CodeGen
     private static readonly MethodInfo HashPasswordMethod = typeof(PascalRuntime.Security).GetMethod("HashPassword", new[] { typeof(string) })!;
     private static readonly MethodInfo VerifyPasswordMethod = typeof(PascalRuntime.Security).GetMethod("VerifyPassword", new[] { typeof(string), typeof(string) })!;
 
+    private static readonly MethodInfo DbConnectMethod = typeof(PascalRuntime.Db).GetMethod("Connect", new[] { typeof(string) })!;
+    private static readonly MethodInfo DbExecuteMethod = typeof(PascalRuntime.Db).GetMethod("Execute", new[] { typeof(string) })!;
+    private static readonly MethodInfo DbQueryMethod = typeof(PascalRuntime.Db).GetMethod("Query", new[] { typeof(string) })!;
+    private static readonly MethodInfo DbNextMethod = typeof(PascalRuntime.Db).GetMethod("Next", Type.EmptyTypes)!;
+    private static readonly MethodInfo DbGetStringMethod = typeof(PascalRuntime.Db).GetMethod("GetString", new[] { typeof(string) })!;
+    private static readonly MethodInfo DbGetIntMethod = typeof(PascalRuntime.Db).GetMethod("GetInt", new[] { typeof(string) })!;
+    private static readonly MethodInfo DbGetFloatMethod = typeof(PascalRuntime.Db).GetMethod("GetFloat", new[] { typeof(string) })!;
+    private static readonly MethodInfo DbCloseMethod = typeof(PascalRuntime.Db).GetMethod("Close", Type.EmptyTypes)!;
+
+    private static readonly MethodInfo HttpReqSetHeaderMethod = typeof(PascalRuntime.HttpReq).GetMethod("SetHeader", new[] { typeof(string), typeof(string) })!;
+    private static readonly MethodInfo HttpReqSetContentTypeMethod = typeof(PascalRuntime.HttpReq).GetMethod("SetContentType", new[] { typeof(string) })!;
+    private static readonly MethodInfo HttpReqGetMethod = typeof(PascalRuntime.HttpReq).GetMethod("Get", new[] { typeof(string) })!;
+    private static readonly MethodInfo HttpReqPostMethod = typeof(PascalRuntime.HttpReq).GetMethod("Post", new[] { typeof(string), typeof(string) })!;
+    private static readonly MethodInfo HttpReqPutMethod = typeof(PascalRuntime.HttpReq).GetMethod("Put", new[] { typeof(string), typeof(string) })!;
+    private static readonly MethodInfo HttpReqDeleteMethod = typeof(PascalRuntime.HttpReq).GetMethod("Delete", new[] { typeof(string) })!;
+    private static readonly MethodInfo HttpRespStatusMethod = typeof(PascalRuntime.HttpReq).GetMethod("Status", Type.EmptyTypes)!;
+    private static readonly MethodInfo HttpRespBodyMethod = typeof(PascalRuntime.HttpReq).GetMethod("Body", Type.EmptyTypes)!;
+    private static readonly MethodInfo HttpRespHeaderMethod = typeof(PascalRuntime.HttpReq).GetMethod("RespHeader", new[] { typeof(string) })!;
+
+    private static readonly MethodInfo MongoConnectMethod = typeof(PascalRuntime.Mongo).GetMethod("Connect", new[] { typeof(string), typeof(string) })!;
+    private static readonly MethodInfo MongoInsertMethod = typeof(PascalRuntime.Mongo).GetMethod("Insert", new[] { typeof(string), typeof(string) })!;
+    private static readonly MethodInfo MongoFindMethod = typeof(PascalRuntime.Mongo).GetMethod("Find", new[] { typeof(string), typeof(string) })!;
+    private static readonly MethodInfo MongoNextMethod = typeof(PascalRuntime.Mongo).GetMethod("Next", Type.EmptyTypes)!;
+    private static readonly MethodInfo MongoGetDocumentMethod = typeof(PascalRuntime.Mongo).GetMethod("GetDocument", Type.EmptyTypes)!;
+    private static readonly MethodInfo MongoUpdateMethod = typeof(PascalRuntime.Mongo).GetMethod("Update", new[] { typeof(string), typeof(string), typeof(string) })!;
+    private static readonly MethodInfo MongoDeleteMethod = typeof(PascalRuntime.Mongo).GetMethod("Delete", new[] { typeof(string), typeof(string) })!;
+    private static readonly MethodInfo MongoCountMethod = typeof(PascalRuntime.Mongo).GetMethod("Count", new[] { typeof(string), typeof(string) })!;
+
     private static readonly HashSet<string> BuiltinNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "Length", "Copy", "UpperCase", "LowerCase", "Trim", "IntToStr", "FloatToStr", "StrToInt", "StrToFloat",
@@ -65,11 +93,18 @@ public sealed class CodeGen
         "JsonGetString", "JsonGetInt", "JsonEscape",
         "JwtSign", "JwtVerify", "JwtPayload", "JwtNow",
         "HashPassword", "VerifyPassword",
+        "DbNext", "DbGetString", "DbGetInt", "DbGetFloat",
+        "HttpReqGet", "HttpReqPost", "HttpReqPut", "HttpReqDelete",
+        "HttpRespStatus", "HttpRespBody", "HttpRespHeader",
+        "MongoNext", "MongoGetDocument", "MongoCount",
     };
 
     private static readonly HashSet<string> BuiltinProcNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "HttpStart", "HttpSetStatus", "HttpSetHeader", "HttpWrite", "HttpEnd",
+        "DbConnect", "DbExecute", "DbQuery", "DbClose",
+        "MongoConnect", "MongoInsert", "MongoFind", "MongoUpdate", "MongoDelete",
+        "HttpReqSetHeader", "HttpReqSetContentType",
     };
 
     private enum SlotKind { Local, Arg }
@@ -1142,6 +1177,68 @@ public sealed class CodeGen
                 RequireArgs(call, 0);
                 _il.Emit(OpCodes.Call, HttpEndMethod);
                 break;
+            case "dbconnect":
+                RequireArgs(call, 1); RequireArgType(call, 0, PascalType.StringT);
+                EmitExpr(call.Args[0]);
+                _il.Emit(OpCodes.Call, DbConnectMethod);
+                break;
+            case "dbexecute":
+                RequireArgs(call, 1); RequireArgType(call, 0, PascalType.StringT);
+                EmitExpr(call.Args[0]);
+                _il.Emit(OpCodes.Call, DbExecuteMethod);
+                break;
+            case "dbquery":
+                RequireArgs(call, 1); RequireArgType(call, 0, PascalType.StringT);
+                EmitExpr(call.Args[0]);
+                _il.Emit(OpCodes.Call, DbQueryMethod);
+                break;
+            case "dbclose":
+                RequireArgs(call, 0);
+                _il.Emit(OpCodes.Call, DbCloseMethod);
+                break;
+            case "httpreqsetheader":
+                RequireArgs(call, 2); RequireArgType(call, 0, PascalType.StringT); RequireArgType(call, 1, PascalType.StringT);
+                EmitExpr(call.Args[0]);
+                EmitExpr(call.Args[1]);
+                _il.Emit(OpCodes.Call, HttpReqSetHeaderMethod);
+                break;
+            case "httpreqsetcontenttype":
+                RequireArgs(call, 1); RequireArgType(call, 0, PascalType.StringT);
+                EmitExpr(call.Args[0]);
+                _il.Emit(OpCodes.Call, HttpReqSetContentTypeMethod);
+                break;
+            case "mongoconnect":
+                RequireArgs(call, 2); RequireArgType(call, 0, PascalType.StringT); RequireArgType(call, 1, PascalType.StringT);
+                EmitExpr(call.Args[0]);
+                EmitExpr(call.Args[1]);
+                _il.Emit(OpCodes.Call, MongoConnectMethod);
+                break;
+            case "mongoinsert":
+                RequireArgs(call, 2); RequireArgType(call, 0, PascalType.StringT); RequireArgType(call, 1, PascalType.StringT);
+                EmitExpr(call.Args[0]);
+                EmitExpr(call.Args[1]);
+                _il.Emit(OpCodes.Call, MongoInsertMethod);
+                break;
+            case "mongofind":
+                RequireArgs(call, 2); RequireArgType(call, 0, PascalType.StringT); RequireArgType(call, 1, PascalType.StringT);
+                EmitExpr(call.Args[0]);
+                EmitExpr(call.Args[1]);
+                _il.Emit(OpCodes.Call, MongoFindMethod);
+                break;
+            case "mongoupdate":
+                RequireArgs(call, 3);
+                RequireArgType(call, 0, PascalType.StringT); RequireArgType(call, 1, PascalType.StringT); RequireArgType(call, 2, PascalType.StringT);
+                EmitExpr(call.Args[0]);
+                EmitExpr(call.Args[1]);
+                EmitExpr(call.Args[2]);
+                _il.Emit(OpCodes.Call, MongoUpdateMethod);
+                break;
+            case "mongodelete":
+                RequireArgs(call, 2); RequireArgType(call, 0, PascalType.StringT); RequireArgType(call, 1, PascalType.StringT);
+                EmitExpr(call.Args[0]);
+                EmitExpr(call.Args[1]);
+                _il.Emit(OpCodes.Call, MongoDeleteMethod);
+                break;
         }
         return true;
     }
@@ -1223,6 +1320,44 @@ public sealed class CodeGen
             case "verifypassword":
                 RequireArgs(f, 2); RequireArgType(f, 0, PascalType.StringT); RequireArgType(f, 1, PascalType.StringT);
                 type = PascalType.Boolean; return true;
+            case "dbnext":
+                RequireArgs(f, 0);
+                type = PascalType.Boolean; return true;
+            case "dbgetstring":
+                RequireArgs(f, 1); RequireArgType(f, 0, PascalType.StringT);
+                type = PascalType.StringT; return true;
+            case "dbgetint":
+                RequireArgs(f, 1); RequireArgType(f, 0, PascalType.StringT);
+                type = PascalType.Integer; return true;
+            case "dbgetfloat":
+                RequireArgs(f, 1); RequireArgType(f, 0, PascalType.StringT);
+                type = PascalType.Real; return true;
+            case "httpreqget":
+            case "httpreqdelete":
+                RequireArgs(f, 1); RequireArgType(f, 0, PascalType.StringT);
+                type = PascalType.Boolean; return true;
+            case "httpreqpost":
+            case "httpreqput":
+                RequireArgs(f, 2); RequireArgType(f, 0, PascalType.StringT); RequireArgType(f, 1, PascalType.StringT);
+                type = PascalType.Boolean; return true;
+            case "httprespstatus":
+                RequireArgs(f, 0);
+                type = PascalType.Integer; return true;
+            case "httprespbody":
+                RequireArgs(f, 0);
+                type = PascalType.StringT; return true;
+            case "httprespheader":
+                RequireArgs(f, 1); RequireArgType(f, 0, PascalType.StringT);
+                type = PascalType.StringT; return true;
+            case "mongonext":
+                RequireArgs(f, 0);
+                type = PascalType.Boolean; return true;
+            case "mongogetdocument":
+                RequireArgs(f, 0);
+                type = PascalType.StringT; return true;
+            case "mongocount":
+                RequireArgs(f, 2); RequireArgType(f, 0, PascalType.StringT); RequireArgType(f, 1, PascalType.StringT);
+                type = PascalType.Integer; return true;
             default:
                 type = default; return false;
         }
@@ -1344,6 +1479,60 @@ public sealed class CodeGen
                 EmitExpr(f.Args[0]);
                 EmitExpr(f.Args[1]);
                 _il.Emit(OpCodes.Call, VerifyPasswordMethod);
+                break;
+            case "dbnext":
+                _il.Emit(OpCodes.Call, DbNextMethod);
+                break;
+            case "dbgetstring":
+                EmitExpr(f.Args[0]);
+                _il.Emit(OpCodes.Call, DbGetStringMethod);
+                break;
+            case "dbgetint":
+                EmitExpr(f.Args[0]);
+                _il.Emit(OpCodes.Call, DbGetIntMethod);
+                break;
+            case "dbgetfloat":
+                EmitExpr(f.Args[0]);
+                _il.Emit(OpCodes.Call, DbGetFloatMethod);
+                break;
+            case "httpreqget":
+                EmitExpr(f.Args[0]);
+                _il.Emit(OpCodes.Call, HttpReqGetMethod);
+                break;
+            case "httpreqdelete":
+                EmitExpr(f.Args[0]);
+                _il.Emit(OpCodes.Call, HttpReqDeleteMethod);
+                break;
+            case "httpreqpost":
+                EmitExpr(f.Args[0]);
+                EmitExpr(f.Args[1]);
+                _il.Emit(OpCodes.Call, HttpReqPostMethod);
+                break;
+            case "httpreqput":
+                EmitExpr(f.Args[0]);
+                EmitExpr(f.Args[1]);
+                _il.Emit(OpCodes.Call, HttpReqPutMethod);
+                break;
+            case "httprespstatus":
+                _il.Emit(OpCodes.Call, HttpRespStatusMethod);
+                break;
+            case "httprespbody":
+                _il.Emit(OpCodes.Call, HttpRespBodyMethod);
+                break;
+            case "httprespheader":
+                EmitExpr(f.Args[0]);
+                _il.Emit(OpCodes.Call, HttpRespHeaderMethod);
+                break;
+            case "mongonext":
+                _il.Emit(OpCodes.Call, MongoNextMethod);
+                break;
+            case "mongogetdocument":
+                _il.Emit(OpCodes.Call, MongoGetDocumentMethod);
+                break;
+            case "mongocount":
+                EmitExpr(f.Args[0]);
+                EmitExpr(f.Args[1]);
+                _il.Emit(OpCodes.Call, MongoCountMethod);
                 break;
         }
         return true;

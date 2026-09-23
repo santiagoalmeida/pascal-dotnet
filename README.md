@@ -1,8 +1,8 @@
 # Pascal.NET
 
-Un compilador de **Pascal a CIL** (el bytecode de .NET) escrito desde cero en C#. No es un intérprete: compila `.pas` a un ensamblado `.dll` real y ejecutable con `dotnet`, usando únicamente `System.Reflection.Emit` — sin `ilasm`, sin herramientas externas, sin dependencias de terceros.
+Un compilador de **Pascal a CIL** (el bytecode de .NET) escrito desde cero en C#. No es un intérprete: compila `.pas` a un ensamblado `.dll` real y ejecutable con `dotnet`, usando únicamente `System.Reflection.Emit` — sin `ilasm`, sin herramientas externas.
 
-Incluye, además del lenguaje, un pequeño **framework web incorporado** (`HttpXxx`) que permite escribir APIs HTTP reales en Pascal, con soporte de JSON, autenticación **JWT** y hashing seguro de contraseñas (**PBKDF2**).
+Incluye, además del lenguaje, un **framework web incorporado** (`HttpXxx` servidor + `HttpReqXxx` cliente) para escribir y consumir APIs HTTP/REST/SOAP reales en Pascal, con JSON, autenticación **JWT**, hashing de contraseñas (**PBKDF2**), y acceso a bases de datos: **SQLite, PostgreSQL, MySQL, SQL Server, Oracle** (`DbXxx`, SQL crudo vía ADO.NET) y **MongoDB** (`MongoXxx`). El lenguaje y el runtime HTTP/JSON/JWT/crypto siguen siendo pura BCL de .NET; los drivers de base de datos son la única dependencia externa del proyecto.
 
 ```pascal
 program MiApi;
@@ -58,7 +58,7 @@ código .pas
 | Carpeta | Qué es |
 |---|---|
 | `PascalCompiler/` | El compilador (`pascalc`). Lexer, parser, AST y generador de código. |
-| `PascalRuntime/` | Librería de soporte en C# que respalda las funciones incorporadas `HttpXxx`, `JsonXxx`, `JwtXxx` y de seguridad. El programa Pascal compilado la referencia en tiempo de ejecución. |
+| `PascalRuntime/` | Librería de soporte en C# que respalda las funciones incorporadas: `HttpXxx`/`HttpReqXxx`, `JsonXxx`, `JwtXxx`, seguridad, `DbXxx` y `MongoXxx`. El programa Pascal compilado la referencia en tiempo de ejecución. |
 | `PascalCompiler/examples/` | Programas `.pas` de ejemplo, usados también como pruebas de humo del compilador. |
 
 ## Uso
@@ -333,6 +333,84 @@ JWT **HS256** real (header.payload.firma, Base64Url, HMAC-SHA256) y hashing de c
 
 Ver `PascalCompiler/examples/api_auth.pas` para un flujo completo de login + JWT protegiendo una ruta.
 
+### Bases de datos SQL (`DbXxx`)
+
+Cursor sobre SQL crudo (sin ORM) contra **SQLite, PostgreSQL, MySQL, SQL Server u Oracle** — el motor se elige con un prefijo en el connection string que le pasás a `DbConnect`. Probado de punta a punta contra un contenedor real de cada uno.
+
+```pascal
+DbConnect('postgres:Host=localhost;Username=postgres;Password=...;Database=pascaldb');
+// otros prefijos: 'mysql:', 'sqlserver:'/'mssql:', 'oracle:', o sin prefijo = archivo SQLite
+
+DbExecute('CREATE TABLE usuarios (id SERIAL PRIMARY KEY, nombre TEXT, edad INTEGER)');
+DbExecute('INSERT INTO usuarios (nombre, edad) VALUES (''Ana'', 30)');
+
+DbQuery('SELECT nombre, edad FROM usuarios');
+while DbNext() do
+  writeln(DbGetString('nombre'), ' - ', DbGetInt('edad'));
+DbClose();
+```
+
+| Nombre | Firma | Descripción |
+|---|---|---|
+| `DbConnect` | `procedure(connStr: string)` | Abre conexión; prefijo `sqlite:`/`postgres:`/`mysql:`/`sqlserver:`/`oracle:` (default: SQLite) |
+| `DbExecute` | `procedure(sql: string)` | Corre SQL sin resultados (DDL/INSERT/UPDATE/DELETE) |
+| `DbQuery` | `procedure(sql: string)` | Prepara un `SELECT` para iterar |
+| `DbNext` | `function: boolean` | Avanza a la siguiente fila |
+| `DbGetString`/`DbGetInt`/`DbGetFloat` | `function(columna: string): ...` | Lee una columna de la fila actual |
+| `DbClose` | `procedure` | Cierra la conexión |
+
+Cada motor usa su propio dialecto SQL (Oracle no tiene `AUTO_INCREMENT`, SQL Server no tiene `SERIAL`, etc.) — el módulo no lo abstrae. Sin queries parametrizadas todavía: el SQL se pasa tal cual, así que armar SQL con datos externos sin escapar es responsabilidad de quien lo usa.
+
+**Nota de build:** `PascalCompiler.csproj` compila contra `$(NETCoreSdkRuntimeIdentifier)` (RID específico, framework-dependent) en vez de portable — necesario para que `Microsoft.Data.SqlClient` resuelva su implementación real en vez de tirar `PlatformNotSupportedException`. Se adapta solo a la plataforma donde se compila.
+
+### MongoDB (`MongoXxx`)
+
+Mongo es un document store, no SQL, así que tiene su propio módulo — documentos como strings JSON, reutilizando `JsonGetString`/`JsonGetInt` para leer campos:
+
+```pascal
+MongoConnect('mongodb://localhost:27017', 'pascaldb');
+MongoInsert('usuarios', '{"nombre":"Ana","edad":30}');
+
+MongoFind('usuarios', '{"edad":{"$gt":18}}');
+while MongoNext() do
+  writeln(JsonGetString(MongoGetDocument(), 'nombre'));
+```
+
+| Nombre | Firma | Descripción |
+|---|---|---|
+| `MongoConnect` | `procedure(connStr, database: string)` | Conecta a una base |
+| `MongoInsert` | `procedure(coleccion, jsonDoc: string)` | Inserta un documento |
+| `MongoFind` | `procedure(coleccion, jsonFiltro: string)` | Prepara una búsqueda (filtro Mongo en JSON; `'{}'` = todos) |
+| `MongoNext` | `function: boolean` | Avanza al siguiente documento encontrado |
+| `MongoGetDocument` | `function: string` | El documento actual, como JSON |
+| `MongoUpdate` | `procedure(coleccion, jsonFiltro, jsonUpdate: string)` | `UpdateMany` (ej. `'{"$set":{"campo":"valor"}}'`) |
+| `MongoDelete` | `procedure(coleccion, jsonFiltro: string)` | `DeleteMany` |
+| `MongoCount` | `function(coleccion, jsonFiltro: string): integer` | Cuenta documentos que matchean |
+
+### Cliente HTTP saliente (`HttpReqXxx`/`HttpRespXxx`)
+
+El contraparte del módulo `HttpXxx` (que sirve requests): este los hace, contra **cualquier servicio HTTP** — REST/JSON, SOAP (con `HttpReqSetContentType('text/xml')` + `HttpReqSetHeader('SOAPAction', ...)` + un body XML), o lo que sea.
+
+```pascal
+HttpReqSetHeader('Authorization', 'Bearer ' + token);
+if HttpReqPost('https://api.ejemplo.com/pedidos', '{"item":"widget"}') then
+  writeln(HttpRespBody())
+else
+  writeln('Fallo, status ', HttpRespStatus());
+```
+
+| Nombre | Firma | Descripción |
+|---|---|---|
+| `HttpReqGet`/`HttpReqDelete` | `function(url: string): boolean` | GET/DELETE; `true` si la respuesta fue 2xx |
+| `HttpReqPost`/`HttpReqPut` | `function(url, body: string): boolean` | POST/PUT con body |
+| `HttpReqSetHeader` | `procedure(nombre, valor: string)` | Header para la *próxima* request (se limpia después de usarlo) |
+| `HttpReqSetContentType` | `procedure(contentType: string)` | Content-Type del body (default `application/json`) |
+| `HttpRespStatus` | `function: integer` | Código de estado de la última respuesta |
+| `HttpRespBody` | `function: string` | Body de la última respuesta |
+| `HttpRespHeader` | `function(nombre: string): string` | Un header de la respuesta |
+
+Probado con un cliente Pascal real pegándole a un servidor Pascal real (`examples/http_client.pas` contra `examples/api.pas`).
+
 ## Ejemplos incluidos
 
 | Archivo | Qué demuestra |
@@ -355,6 +433,13 @@ Ver `PascalCompiler/examples/api_auth.pas` para un flujo completo de login + JWT
 | `oop_polymorphism.pas` | `virtual`/`override`/`inherited` — despacho polimórfico real (no solo estático) |
 | `api.pas` | API HTTP con rutas parametrizadas y JSON |
 | `api_auth.pas` | Login, hashing de contraseñas y rutas protegidas con JWT |
+| `http_client.pas` | Cliente HTTP saliente (GET/POST/headers) — probado contra `api.pas` real |
+| `db_sqlite.pas` | `DbXxx` contra SQLite (archivo local) |
+| `db_postgres.pas` | `DbXxx` contra PostgreSQL |
+| `db_mysql.pas` | `DbXxx` contra MySQL |
+| `db_sqlserver.pas` | `DbXxx` contra SQL Server |
+| `db_oracle.pas` | `DbXxx` contra Oracle |
+| `db_mongo.pas` | `MongoXxx` — insert/find/update/count sobre documentos JSON |
 
 ## Limitaciones conocidas / decisiones de diseño
 
@@ -369,14 +454,15 @@ Este es un proyecto experimental, no un compilador de producción. Simplificacio
 - **Sin genéricos** (`TFoo<T>`) — ni en clases ni en funciones.
 - **`HttpListener` es de un solo hilo/secuencial** (`HttpWait()` bloquea) — no maneja requests concurrentes. Suficiente para aprender/prototipar, no para producción.
 - **Sin manejo de excepciones** (`try/except`).
-- **No hay interoperabilidad genérica con .NET** (no se puede llamar a cualquier clase de la BCL o un paquete NuGet) — solo el set fijo de funciones incorporadas documentado arriba. Esto descarta, por ejemplo, un ORM como Entity Framework: necesitaría genéricos, LINQ/expression trees y `async`/`await`, que son features de compilador en sí mismas.
+- **`DbXxx` no tiene queries parametrizadas** — el SQL se pasa como texto plano; construir SQL con datos externos sin escapar es cosa de quien lo usa.
+- **No hay interoperabilidad genérica con .NET** (no se puede llamar a cualquier clase de la BCL o un paquete NuGet arbitrario) — solo el set fijo de funciones incorporadas documentado arriba (que ya cubre HTTP servidor/cliente, JSON, JWT, y ahora cinco motores SQL + MongoDB). Esto sigue descartando, por ejemplo, un ORM como Entity Framework: necesitaría genéricos, LINQ/expression trees y `async`/`await`, que son features de compilador en sí mismas.
 - El compilador y sus mensajes de error están en **español**.
 
 ## Contribuciones
 
 Este proyecto está abierto a contribuciones — PRs, issues, ideas de features o reportes de bugs son bienvenidos. Si vas a agregar una feature grande, abrí un issue primero para discutir el enfoque (el código sigue un estilo bastante directo: sin abstracciones prematuras, con comentarios solo donde el *por qué* no es obvio).
 
-Ideas abiertas para quien quiera meter mano: genéricos, `try/except`, arrays de N dimensiones, records anidados/con campos array, encadenar campos-objeto (`obj.campo.campo2`), `inherited Create(args)` para constructores, un mini módulo `DbXxx` sobre ADO.NET (SQL crudo) para persistencia, un modo `--optimize`, tests automatizados.
+Ideas abiertas para quien quiera meter mano: genéricos, `try/except`, arrays de N dimensiones, records anidados/con campos array, encadenar campos-objeto (`obj.campo.campo2`), `inherited Create(args)` para constructores, queries parametrizadas en `DbXxx`, un modo `--optimize`, tests automatizados.
 
 ## Licencia
 
