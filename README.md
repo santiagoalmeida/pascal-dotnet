@@ -199,7 +199,84 @@ begin
 end.
 ```
 
-Los métodos se compilan como métodos de instancia **reales** de CLR (no procedimientos estáticos con un parámetro extra) — `Self` es el `this` implícito, y las llamadas usan `callvirt`. `TClase.Create()` construye una instancia nueva; una variable de tipo clase empieza en `nil` hasta que se le asigna una. Por ahora **no hay herencia** (`class(TPadre)`) ni métodos `virtual`/`override` — ver Limitaciones.
+Los métodos se compilan como métodos de instancia **reales** de CLR (no procedimientos estáticos con un parámetro extra) — `Self` es el `this` implícito, y las llamadas usan `callvirt`. `TClase.Create()` construye una instancia nueva; una variable de tipo clase empieza en `nil` hasta que se le asigna una.
+
+#### Encapsulamiento (`private`/`public`)
+
+```pascal
+type
+  TAccount = class
+  private
+    balance: integer;
+  public
+    procedure Deposit(amount: integer);
+    function GetBalance: integer;
+  end;
+```
+
+Un miembro `private` solo es accesible desde dentro de un método de la **misma clase que lo declaró** (ni siquiera una subclase puede tocarlo) — acceder desde afuera es un error de compilación, no una convención.
+
+#### Composición de objetos e inyección de dependencias
+
+Un campo de clase puede ser de tipo `record` o `class`, no solo escalar:
+
+```pascal
+type
+  TLogger = class
+    procedure Log(msg: string);
+  end;
+
+  TService = class
+    logger: TLogger;
+    constructor Create(l: TLogger);
+    procedure DoWork;
+  end;
+
+constructor TService.Create(l: TLogger);
+begin
+  logger := l;              // inyección real por constructor
+end;
+
+procedure TService.DoWork;
+begin
+  logger.Log('trabajando'); // campo-objeto implícito, usado como si fuera una variable
+end;
+```
+
+`constructor Create(...)` admite parámetros (incluidos objetos), con implementación separada igual que los métodos — es lo que hace viable la inyección de dependencias real, no solo asignar el campo a mano después de `Create()`.
+
+**Límite:** un campo-objeto se puede asignar (desde otra variable o `Create()`), pero no encadenar otro nivel (`obj.campo.campo2` no está soportado).
+
+#### Herencia, `virtual`/`override`, `inherited`
+
+```pascal
+type
+  TAnimal = class
+    name: string;
+    procedure Speak; virtual;
+  end;
+
+  TDog = class(TAnimal)
+    procedure Speak; override;
+  end;
+
+procedure TDog.Speak;
+begin
+  inherited Speak;              // comportamiento base primero...
+  writeln(name, ' dice: Guau!'); // ...despues el propio
+end;
+
+var
+  a: TAnimal;
+  d: TDog;
+begin
+  d := TDog.Create();
+  a := d;      // una variable TAnimal puede apuntar a un TDog
+  a.Speak();   // despacha a TDog.Speak en tiempo de ejecución — polimorfismo real
+end.
+```
+
+El despacho es polimorfismo real de CLR (`MethodAttributes.Virtual` + `DefineMethodOverride`), no resolución de nombres en tiempo de compilación — una variable declarada como la clase base puede contener una instancia de cualquier subclase, y el método que se ejecuta es el de la clase concreta del objeto. `inherited Metodo(args)` llama a la versión base directamente (sin volver a pasar por el despacho virtual).
 
 ### Funciones incorporadas
 
@@ -271,6 +348,11 @@ Ver `PascalCompiler/examples/api_auth.pas` para un flujo completo de login + JWT
 | `oop_rectangle.pas` | Métodos llamándose entre sí vía `Self.Metodo()`, método booleano usado en `if` |
 | `oop_bank_account.pas` | Objetos pasados como parámetro a una función libre (semántica de referencia) |
 | `oop_task.pas` | Reasignar `TClase.Create()` a la misma variable, campos `string`/`boolean` |
+| `oop_encapsulation.pas` | `private`/`public` — acceso externo a un campo privado rechazado en compilación |
+| `oop_composition.pas` | Campo de tipo objeto (`logger: TLogger`), usado como dependencia inyectada a mano |
+| `oop_ctor_injection.pas` | `constructor Create(...)` con parámetros — inyección de dependencias real |
+| `oop_inheritance.pas` | `class(TPadre)` — campos/métodos heredados, usados desde afuera y desde `Self` |
+| `oop_polymorphism.pas` | `virtual`/`override`/`inherited` — despacho polimórfico real (no solo estático) |
 | `api.pas` | API HTTP con rutas parametrizadas y JSON |
 | `api_auth.pas` | Login, hashing de contraseñas y rutas protegidas con JWT |
 
@@ -281,7 +363,10 @@ Este es un proyecto experimental, no un compilador de producción. Simplificacio
 - **Arrays y records se comparten por referencia**, incluso sin `var` — se aparta de la semántica de valor estricta de Pascal, pero simplifica enormemente el codegen (son tipos `class`/array de .NET, no `struct`).
 - **Arrays 2D** son jagged arrays (`T[][]`), no arrays rectangulares nativos (`T[,]`).
 - **No hay arrays de N dimensiones genéricas** (solo 1D y 2D), ni records anidados, ni records con campos array.
-- **Las clases no soportan herencia** todavía (`class(TPadre)`), ni métodos `virtual`/`override`, ni constructores con parámetros (`Create` siempre es sin argumentos), ni parámetros/retornos de tipo clase en métodos de instancia.
+- **Un campo-objeto de clase no se puede encadenar** (`obj.campo.campo2`) — solo asignar o usar como receptor de un método/campo de un solo nivel.
+- **Un método de instancia solo declara parámetros escalares** en su firma de clase — pasar objetos como argumento sí funciona (se valida en la llamada), pero no está chequeado a nivel de la declaración del método en sí.
+- **Un constructor con parámetros no se encadena automáticamente** cuando la clase base también tiene uno — hace falta declarar el propio `constructor Create` (no hay `inherited Create(args)` para constructores, solo para métodos normales).
+- **Sin genéricos** (`TFoo<T>`) — ni en clases ni en funciones.
 - **`HttpListener` es de un solo hilo/secuencial** (`HttpWait()` bloquea) — no maneja requests concurrentes. Suficiente para aprender/prototipar, no para producción.
 - **Sin manejo de excepciones** (`try/except`).
 - **No hay interoperabilidad genérica con .NET** (no se puede llamar a cualquier clase de la BCL o un paquete NuGet) — solo el set fijo de funciones incorporadas documentado arriba. Esto descarta, por ejemplo, un ORM como Entity Framework: necesitaría genéricos, LINQ/expression trees y `async`/`await`, que son features de compilador en sí mismas.
@@ -291,7 +376,7 @@ Este es un proyecto experimental, no un compilador de producción. Simplificacio
 
 Este proyecto está abierto a contribuciones — PRs, issues, ideas de features o reportes de bugs son bienvenidos. Si vas a agregar una feature grande, abrí un issue primero para discutir el enfoque (el código sigue un estilo bastante directo: sin abstracciones prematuras, con comentarios solo donde el *por qué* no es obvio).
 
-Ideas abiertas para quien quiera meter mano: herencia y `virtual`/`override` sobre la base de OOP ya armada, `try/except`, arrays de N dimensiones, records anidados/con campos array, un mini módulo `DbXxx` sobre ADO.NET (SQL crudo) para persistencia, un modo `--optimize`, tests automatizados.
+Ideas abiertas para quien quiera meter mano: genéricos, `try/except`, arrays de N dimensiones, records anidados/con campos array, encadenar campos-objeto (`obj.campo.campo2`), `inherited Create(args)` para constructores, un mini módulo `DbXxx` sobre ADO.NET (SQL crudo) para persistencia, un modo `--optimize`, tests automatizados.
 
 ## Licencia
 
